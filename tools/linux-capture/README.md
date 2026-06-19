@@ -22,7 +22,7 @@ no second decoder to drift.
 | WHOOP 5.0 — bond + `CLIENT_HELLO` session + command set | ✅ verified on real hardware |
 | WHOOP 5.0 — historical offload trigger (`SEND_HISTORICAL_DATA`) | ✅ verified (full burst, same trim-cursor mechanism as 4.0) |
 | WHOOP 5.0 — historical **biometrics** (type-47 v18) | ✅ unix + HR + R-R + gravity decoded (`parseFrameWhoop5`); cross-validated vs a 4C on the same person/window (HR corr 0.96, ±1 bpm at rest) |
-| WHOOP 5.0 — optical channels (PPG/SpO₂/skin-temp) + v26 layout | ⬜ open — kept raw (no on-device ground truth yet) |
+| WHOOP 5.0 — optical channels (PPG/SpO₂/skin-temp) + v26 layout | ◑ partial — v26 channel-0 PPG validated **real** (HR-locked, corr +0.907) → **spot HRV** matches cloud (111 vs 110 ms, `whoop_spot_hrv.py`); SpO₂/skin-temp still raw (AC-coupled PPG has no DC) |
 
 See [`../../docs/BLE_REVERSE_ENGINEERING.md`](../../docs/BLE_REVERSE_ENGINEERING.md) §3 for the
 protocol details these tools exercise.
@@ -88,7 +88,9 @@ the Python capture side does not require Swift.
 | `pair_probe.py` | One-shot WHOOP 5 bonding probe: scan → connect → `pair()` → test `fd4b` access. `python3 pair_probe.py <MAC>`. |
 | `analyze_v26_waveform.py` | Characterise the WHOOP 5 **v26** type-47 buffer as PPG @24 Hz using its own co-timestamped HR as ground truth. |
 | `analyze_v25_waveform.py` | **WHOOP 4.0 v25 PPG → HR span-pinning harness ([#194](https://noop.fans/NoopApp/noop/issues/194)).** Sweeps the unpinned PPG span (start + sample-count) across a corpus of captures at *known* HRs and reports the span where recovered HR **tracks** ground truth instead of the `1440/N` autocorrelation artifact — or, on resting-only data, exactly what capture is still needed. `--selftest` proves it on synthetic pulses; no args runs the bundled-frames demo. Stdlib only. |
+| `whoop_spot_hrv.py` | **Spot HRV (RMSSD) from the sparse PPG bursts.** Reads the v26 `feat_ppg` channel-0 24 Hz waveform, detects beats, computes RMSSD per PPG-covered window. Validated cloud-grade where a burst covers deep sleep (111 ms vs cloud 110). See [Spot HRV](#spot-hrv-from-sparse-ppg-whoop_spot_hrvpy). |
 | `test_whoop_frame.py` | Unit tests for framing / reassembly / HR parsing / buzz frames (no `bleak` needed). |
+| `test_whoop_spot_hrv.py` | Unit tests for the spot-HRV DSP (synthetic-signal HR/RMSSD recovery, ectopic rejection, grid reconstruction; `pytest`, stdlib only). |
 | `requirements.txt` | `bleak` (runtime dep for capture only). |
 
 ## Capture (`whoop_capture.py`)
@@ -397,6 +399,42 @@ themselves and risk diverging on the offsets.
 
 > The decoded-value tables are **derived state** — delete them any time and rebuild with `decode --full`; the
 > raw `frames` are the source of truth. Join `feat_second` to `labels` on `unix` for a labelled training set.
+
+## Spot HRV from sparse PPG (`whoop_spot_hrv.py`)
+
+> **Linux-first.** This computes HRV on Linux from data the offload already gives — a capability the rest
+> of the app does **not** yet implement correctly (the apps surface the strap/cloud HRV; they don't derive
+> RMSSD from the offloaded PPG). Documented here as the reference; port to the apps later.
+
+The offload's per-second `rr_packed`/`rr` field **saturates and underestimates** HRV. But the strap also
+banks a **real 24 Hz PPG waveform** in its sparse optical bursts (record version 26 → `feat_ppg` channel 0).
+That waveform is genuine cardiac PPG — its fundamental **tracks heart rate** (validated: corr **+0.907** over
+14 bursts). So beats can be detected and RMSSD computed:
+
+```bash
+python3 whoop_spot_hrv.py --db captures/whoop.db --device 1                  # every PPG-covered window
+python3 whoop_spot_hrv.py --db captures/whoop.db --device 1 --start S --end E   # one window (e.g. a deep-sleep span)
+```
+```
+window_start   span     HR   RMSSD  beats  quality
+  0             40s    84   112ms     44  GOOD
+  1120          40s   109      -       1  POOR
+```
+
+**Validated cloud-grade where coverage exists.** On a captured night where a burst fell inside WHOOP's
+deep-sleep HRV window, the PPG-derived RMSSD was **111 ms vs the cloud's 110** — and the offload `rr` field
+maxed at 99 (it can't reach it). So the *accuracy* is there.
+
+**Honest limits** (the tool labels each window's `quality`):
+- **Sparse** — bursts are ~40 s every ~18.7 min (~3.3 %), so a window gets HRV only if a burst lands in it.
+  This is a **spot** HRV (best: a burst inside deep sleep), **not** continuous overnight HRV.
+- **Coarse** — 24 Hz quantises beat timing (~42 ms/sample); sub-sample interpolation + ectopic rejection
+  help, but trust `GOOD` (≥25 clean beats), treat `COARSE`/`POOR` with caution. HR (rate) is solid; RMSSD is
+  approximate.
+- **HRV only, not SpO₂** — the PPG is AC-coupled (no DC red/IR).
+
+Best consumer: **sleep/recovery** — a deep-sleep spot RMSSD is a recovery proxy and an HRV input the sleep
+stager otherwise lacks.
 
 ## Decode (`whoop-decode`)
 
