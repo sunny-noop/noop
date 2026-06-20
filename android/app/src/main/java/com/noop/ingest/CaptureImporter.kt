@@ -1,0 +1,339 @@
+package com.noop.ingest
+
+import android.content.Context
+import android.net.Uri
+import com.noop.ble.RawHistoryArchive
+import com.noop.ble.WhoopBleClient
+import com.noop.data.ImportSummary
+import com.noop.data.InsertCounts
+import com.noop.data.StreamBatch
+import com.noop.data.WhoopRepository
+import com.noop.protocol.DeviceFamily
+import com.noop.protocol.extractHistoricalStreams
+import com.noop.protocol.rejectedHistoricalRecords
+import org.json.JSONException
+import org.json.JSONObject
+import java.io.Reader
+import java.io.StringReader
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+
+/**
+ * Imports a `capture.json` produced by tools/linux-capture/whoop_sync.py `export` into the local
+ * Room store by running its raw strap frames through the SAME on-device historical decoder the live
+ * BLE offload uses (extractHistoricalStreams -> WhoopRepository.insert). No new decode logic; this is
+ * pure file -> frames -> decode -> store plumbing, so externally-captured history (e.g. a Linux BLE
+ * offload) lands in the app exactly as if synced over Bluetooth.
+ *
+ * capture.json shape (one object per stored frame):
+ *   [{"hex":"aa50...","char":"61080003-...","ts_ms":1718...,"hr":75}, ...]
+ * `char` is the strap's notify-characteristic UUID; its family marker ("6108"->WHOOP4, "fd4b"->WHOOP5)
+ * selects the decoder. ts_ms/hr are informational; decode uses each record's embedded unix.
+ *
+ * parse/decode/summarize are pure so they are JVM unit-testable (CaptureImporterTest); only
+ * importCapture touches the SAF Uri / Room / reject archive.
+ */
+object CaptureImporter {
+    const val SOURCE_LABEL = "Raw capture"
+
+    /** Historical data attaches to the seeded primary WHOOP device so the dashboard shows it. */
+    const val DEFAULT_DEVICE_ID = "my-whoop"
+
+    // ---- pure: char -> family ----
+
+    /** Map a stored notify-characteristic UUID to its device family. Null = unrecognised. */
+    internal fun familyForChar(char: String?): DeviceFamily? {
+        val c = char?.lowercase() ?: return null
+        return when {
+            c.contains("fd4b") -> DeviceFamily.WHOOP5
+            c.contains("6108") -> DeviceFamily.WHOOP4
+            else -> null
+        }
+    }
+
+    /** Lenient hex -> bytes. Returns null on odd length or a non-hex char. */
+    internal fun hexToBytes(hex: String): ByteArray? {
+        val s = hex.trim()
+        if (s.isEmpty() || s.length % 2 != 0) return null
+        val out = ByteArray(s.length / 2)
+        var i = 0
+        while (i < s.length) {
+            val hi = Character.digit(s[i], 16)
+            val lo = Character.digit(s[i + 1], 16)
+            if (hi < 0 || lo < 0) return null
+            out[i / 2] = ((hi shl 4) or lo).toByte()
+            i += 2
+        }
+        return out
+    }
+
+    // ---- pure: parse capture.json ----
+
+    /** Frames grouped by family, with bookkeeping counts. */
+    data class Parsed(
+        val byFamily: Map<DeviceFamily, List<ByteArray>>,
+        val totalFrames: Int,
+        val skipped: Int, // unknown-char or unparsable-hex rows
+    )
+
+    /** Parse capture.json text into per-family frame lists. Throws org.json.JSONException on non-array input. */
+    fun parse(jsonText: String): Parsed = parse(StringReader(jsonText))
+
+    /**
+     * Streaming parse: pull one top-level JSON value at a time off [reader] so a multi-day capture
+     * (tens of MB, hundreds of thousands of frames) never materialises as a giant String + JSONArray.
+     * Peak memory is the per-family ByteArray lists plus one element substring — not the whole file.
+     * Throws org.json.JSONException on non-array / malformed input, exactly like the old DOM parse.
+     */
+    fun parse(reader: Reader): Parsed {
+        val groups = LinkedHashMap<DeviceFamily, MutableList<ByteArray>>()
+        var total = 0
+        var skipped = 0
+        JsonArrayScanner(reader).forEachElement { elem ->
+            val obj = elem.asJsonObjectOrNull()
+            if (obj == null) { skipped++; return@forEachElement }
+            total++
+            val family = familyForChar(if (obj.has("char")) obj.optString("char") else null)
+            val frame = if (obj.has("hex")) hexToBytes(obj.optString("hex")) else null
+            if (family == null || frame == null) { skipped++; return@forEachElement }
+            groups.getOrPut(family) { ArrayList() }.add(frame)
+        }
+        return Parsed(groups, total, skipped)
+    }
+
+    /** A top-level array element is a frame only if it is a JSON object; everything else is skipped
+     *  (matches the old `JSONArray.optJSONObject(i) == null` behaviour). A malformed object throws. */
+    private fun String.asJsonObjectOrNull(): JSONObject? =
+        if (trimStart().startsWith("{")) JSONObject(this) else null
+
+    // ---- pure: decode ----
+
+    /** Decoded streams plus the frames that failed to decode (to be reject-archived), per family. */
+    data class Decoded(
+        val batches: Map<DeviceFamily, StreamBatch>,
+        val rejects: Map<DeviceFamily, List<ByteArray>>,
+        val offloadFrames: Int,
+    )
+
+    /**
+     * Filter each family's frames to offload frames (drops realtime/control), then decode in a single
+     * pass per family via extractHistoricalStreams with clockRef 0/0 — historical records carry an
+     * embedded unix, exactly as RawHistoryArchive.replayIfNeeded decodes archived frames.
+     */
+    fun decode(parsed: Parsed): Decoded {
+        val batches = LinkedHashMap<DeviceFamily, StreamBatch>()
+        val rejects = LinkedHashMap<DeviceFamily, List<ByteArray>>()
+        var offload = 0
+        for ((family, frames) in parsed.byFamily) {
+            val offloadFrames = frames.filter { WhoopBleClient.isOffloadFrame(it, family) }
+            if (offloadFrames.isEmpty()) continue
+            offload += offloadFrames.size
+            val batch = extractHistoricalStreams(offloadFrames, 0, 0, family)
+            if (!batch.isEmpty) batches[family] = batch
+            val rej = rejectedHistoricalRecords(offloadFrames, family)
+            if (rej.isNotEmpty()) rejects[family] = rej
+        }
+        return Decoded(batches, rejects, offload)
+    }
+
+    // ---- pure: summarize ----
+
+    private val DAY: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC)
+
+    /** Build the user-facing ImportSummary from decode output + the rows actually inserted. */
+    fun summarize(decoded: Decoded, inserted: InsertCounts, parsed: Parsed): ImportSummary {
+        val counts = linkedMapOf(
+            "hr" to inserted.hr, "rr" to inserted.rr, "gravity" to inserted.gravity,
+            "spo2" to inserted.spo2, "skinTemp" to inserted.skinTemp, "resp" to inserted.resp,
+            "steps" to inserted.steps, "events" to inserted.events, "battery" to inserted.battery,
+        ).filterValues { it > 0 }
+
+        val allTs = decoded.batches.values.flatMap { b -> b.hr.map { it.ts } + b.gravity.map { it.ts } }
+        val first = allTs.minOrNull()?.let { DAY.format(Instant.ofEpochSecond(it)) }
+        val last = allTs.maxOrNull()?.let { DAY.format(Instant.ofEpochSecond(it)) }
+        val rejectCount = decoded.rejects.values.sumOf { it.size }
+        val total = counts.values.sum()
+
+        val message = buildString {
+            append("Imported $total rows from ${decoded.offloadFrames} historical frames")
+            if (first != null && last != null) append(" ($first → $last)")
+            append(".")
+            if (parsed.skipped > 0) append(" Skipped ${parsed.skipped} unrecognised frame(s).")
+            if (rejectCount > 0) append(" Archived $rejectCount undecodable frame(s) for a future decoder.")
+        }
+        return ImportSummary(SOURCE_LABEL, counts, first, last, message)
+    }
+
+    private fun InsertCounts.plus(o: InsertCounts) = InsertCounts(
+        hr = hr + o.hr, rr = rr + o.rr, events = events + o.events, battery = battery + o.battery,
+        spo2 = spo2 + o.spo2, skinTemp = skinTemp + o.skinTemp, steps = steps + o.steps,
+        resp = resp + o.resp, gravity = gravity + o.gravity,
+    )
+
+    // ---- IO: the entry the UI calls ----
+
+    /**
+     * Read the SAF [uri] capture.json, decode it, insert decoded streams under [deviceId], and
+     * reject-archive undecodable frames. Idempotent: re-importing dedupes via Room natural keys.
+     *
+     * The file is parsed by STREAMING one frame object at a time off the SAF input stream (see
+     * [parse]); a multi-day capture is never loaded whole into a String + JSONArray, which used to
+     * OOM (a 74 MB capture needs ~150 MB just for the UTF-16 String, before the DOM on top).
+     */
+    suspend fun importCapture(
+        context: Context,
+        uri: Uri,
+        repo: WhoopRepository,
+        archive: RawHistoryArchive,
+        deviceId: String = DEFAULT_DEVICE_ID,
+    ): ImportSummary {
+        val parsed = try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                input.bufferedReader(Charsets.UTF_8).use { parse(it) }
+            } ?: return ImportSummary.failure(SOURCE_LABEL, "Could not open the file.")
+        } catch (e: JSONException) {
+            return ImportSummary.failure(
+                SOURCE_LABEL, "Not a valid capture.json (expected a JSON array of frames).",
+            )
+        } catch (e: Exception) {
+            return ImportSummary.failure(SOURCE_LABEL, "Could not read the file: ${e.message ?: "unknown error"}")
+        }
+
+        val decoded = decode(parsed)
+
+        // Reject-archive undecodable offload frames FIRST — before the empty-batch early return — so a
+        // capture the current decoder can't map yet (e.g. a future record layout) is still preserved
+        // for a later release, exactly as the live offload archives undecodable history before acking.
+        for ((family, rej) in decoded.rejects) {
+            runCatching { archive.append(rej, trim = 0, family = family) }
+        }
+
+        if (decoded.batches.isEmpty()) {
+            val archived = decoded.rejects.values.sumOf { it.size }
+            return if (archived == 0) {
+                ImportSummary.failure(SOURCE_LABEL, "No historical WHOOP frames found in this file.")
+            } else {
+                ImportSummary.failure(
+                    SOURCE_LABEL,
+                    "No frames could be decoded yet; archived $archived undecodable frame(s) for a future decoder.",
+                )
+            }
+        }
+
+        var totals = InsertCounts()
+        for ((_, batch) in decoded.batches) {
+            totals = totals.plus(repo.insert(batch, deviceId))
+        }
+        return summarize(decoded, totals, parsed)
+    }
+}
+
+/**
+ * Minimal streaming reader over a JSON array of objects. Pulls one top-level element at a time so a
+ * huge capture.json is processed incrementally instead of buffered whole. It is a SPLITTER, not a full
+ * JSON parser: it slices each top-level value into a substring (respecting strings, escapes and nested
+ * braces/brackets) and hands that to org.json's [JSONObject] for the actual field parsing — so the
+ * field semantics stay identical to the old DOM path, only the array iteration is streamed.
+ *
+ * Throws [JSONException] on non-array or truncated input, matching the old `JSONArray(text)` contract.
+ */
+private class JsonArrayScanner(reader: Reader) {
+    private val r: Reader = reader.buffered()
+    private var pushed = NO_CHAR
+    private var consumed = 0L
+
+    private fun read(): Int {
+        if (pushed != NO_CHAR) { val c = pushed; pushed = NO_CHAR; return c }
+        val c = r.read()
+        if (c >= 0 && ++consumed > MAX_CHARS) throw JSONException("capture.json exceeds size limit")
+        return c
+    }
+
+    private fun pushback(c: Int) { pushed = c }
+
+    private fun skipWhitespace(): Int {
+        while (true) {
+            val c = read()
+            if (c == -1 || !Character.isWhitespace(c)) return c
+        }
+    }
+
+    /** Invoke [onElement] with each top-level array element as a raw JSON substring. */
+    fun forEachElement(onElement: (String) -> Unit) {
+        if (skipWhitespace() != '['.code) throw JSONException("Expected a JSON array of frames")
+        while (true) {
+            val c = skipSeparators()
+            when (c) {
+                ']'.code -> return
+                -1 -> throw JSONException("Unterminated JSON array")
+                else -> onElement(readValue(c))
+            }
+        }
+    }
+
+    /** Skip whitespace and element-separating commas; return the next significant char (or -1/']'). */
+    private fun skipSeparators(): Int {
+        while (true) {
+            val c = skipWhitespace()
+            if (c != ','.code) return c
+        }
+    }
+
+    /** Read one complete JSON value whose first char is [first]; return it verbatim. */
+    private fun readValue(first: Int): String {
+        val sb = StringBuilder()
+        sb.append(first.toChar())
+        when (first.toChar()) {
+            '{', '[' -> {
+                var depth = 1
+                var inString = false
+                var escape = false
+                while (depth > 0) {
+                    val c = read()
+                    if (c == -1) throw JSONException("Unterminated JSON value")
+                    val ch = c.toChar()
+                    sb.append(ch)
+                    when {
+                        escape -> escape = false
+                        inString -> when (ch) { '\\' -> escape = true; '"' -> inString = false }
+                        ch == '"' -> inString = true
+                        ch == '{' || ch == '[' -> depth++
+                        ch == '}' || ch == ']' -> depth--
+                    }
+                }
+            }
+            '"' -> {
+                var escape = false
+                while (true) {
+                    val c = read()
+                    if (c == -1) throw JSONException("Unterminated JSON string")
+                    val ch = c.toChar()
+                    sb.append(ch)
+                    when {
+                        escape -> escape = false
+                        ch == '\\' -> escape = true
+                        ch == '"' -> return sb.toString()
+                    }
+                }
+            }
+            else -> { // bare scalar: number / true / false / null — ends at ws, comma or ']'
+                while (true) {
+                    val c = read()
+                    if (c == -1) break
+                    val ch = c.toChar()
+                    if (Character.isWhitespace(c) || ch == ',' || ch == ']') { pushback(c); break }
+                    sb.append(ch)
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    companion object {
+        private const val NO_CHAR = -2
+        /** A multi-day capture is tens of MB; 256 M chars is a generous ceiling against a runaway file. */
+        private const val MAX_CHARS = 256L shl 20
+    }
+}

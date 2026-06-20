@@ -50,9 +50,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
+import com.noop.ble.RawHistoryArchive
 import com.noop.data.DataBackup
 import com.noop.data.ImportSummary
 import com.noop.ingest.AppleHealthImporter
+import com.noop.ingest.CaptureImporter
 import com.noop.ingest.HealthConnectImporter
 import com.noop.ingest.HealthConnectWriter
 import com.noop.ingest.LiftingImporter
@@ -220,6 +222,20 @@ fun DataSourcesScreen(vm: AppViewModel) {
     val nutritionImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) runImport { NutritionCsvImporter.importCsv(context, uri, vm.repo) } }
+
+    // Raw capture (.json) offloaded on another device (e.g. Linux whoop_sync.py): decode its
+    // history on-device through CaptureImporter, archiving any frames it can't yet map.
+    val captureImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) runImport {
+            // Raw samples land via importCapture, but recovery/strain/sleep are computed, not stored.
+            // Kick an immediate scoring pass (widened back to the import's first day) so the dashboard
+            // populates now instead of staying dark until the 15-min analyze loop or an app restart.
+            CaptureImporter.importCapture(context, uri, vm.repo, RawHistoryArchive(context))
+                .also { vm.analyzeImported(it.firstDay) }
+        }
+    }
 
     // Lifting: imported workouts also need the Workouts list to reload (runImport only re-counts).
     val liftingImportLauncher = rememberLauncherForActivityResult(
@@ -526,6 +542,23 @@ fun DataSourcesScreen(vm: AppViewModel) {
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth(),
             ) { xiaomiImportLauncher.launch(arrayOf("*/*")) }
+        }
+
+        // --- Raw capture (.json) — frames offloaded on another device, decoded on-device ---
+        SourceCard(
+            title = "Raw capture (.json)",
+            icon = Icons.Filled.FileUpload,
+            subtitle = "Import a capture.json saved from your strap on another device — for example the " +
+                "Linux whoop_sync.py tool, using its \"export\" command to write the file. NOOP decodes " +
+                "its history on this phone — no cloud, no WHOOP app. Anything it can't yet map is kept " +
+                "so a later release can recover it.",
+        ) {
+            BackupButton(
+                label = if (busy) "Importing…" else "Import raw capture (.json)…",
+                icon = Icons.Filled.FileUpload,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) { captureImportLauncher.launch(arrayOf("application/json", "*/*")) }
         }
 
         // --- Lifting log (Hevy CSV / Liftosaur JSON) ---

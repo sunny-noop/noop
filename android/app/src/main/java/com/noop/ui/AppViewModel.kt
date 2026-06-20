@@ -50,6 +50,9 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.LocalDate
+import java.time.format.DateTimeParseException
+import java.time.temporal.ChronoUnit
 import kotlin.math.roundToInt
 
 /**
@@ -461,32 +464,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
             while (isActive) {
                 runCatching {
-                    IntelligenceEngine.analyzeRecent(
-                        repo = repository,
-                        profile = currentProfile(),
-                        importedDeviceId = deviceId,
-                        maxHROverride = profileStore.hrMaxOverride
-                            .takeIf { it > 0 }?.toDouble(),
-                        // I2 read-through (Phase 1B-4): resolve the single owning device per day from the
-                        // registry. A single-WHOOP install resolves to [deviceId] for every day, so the
-                        // reads stay byte-identical; multi-source installs score each day from one source.
-                        ownerSource = RegistryDayOwnerSource(noopApp.deviceRegistry),
-                        // Steps-estimate calibration: feed the user's manual override in (null = auto-fit),
-                        // and mirror the fitted/manual model back into ProfileStore so the Settings/Steps
-                        // screen can show + adjust it. Mirrors the macOS engine writing into ProfileStore.
-                        manualStepCoefficient = profileStore.stepsManualOverride,
-                        persistStepsCalibration = { cal ->
-                            profileStore.stepsCalibrationCoefficient = cal.coefficient
-                            profileStore.stepsCalibrationSampleDays = cal.sampleDays
-                            profileStore.stepsCalibrationConfidence = cal.confidence
-                            profileStore.stepsCalibrationManual = cal.manual
-                        },
-                        // Manual "Recalibrate baseline" anchor (Settings → Charge advanced). The analytics
-                        // layer is Context-free, so read the epoch (whole seconds, written as a Long by the
-                        // button) here and thread it down — foldHistory drops every HRV night before it.
-                        baselineEpoch = NoopPrefs.of(appContext)
-                            .getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble(),
-                    )
+                    runAnalyzePass()
                     // analyzeRecent now hops to Dispatchers.Default; a scope cancellation surfaces as a
                     // CancellationException that runCatching would otherwise swallow, breaking the loop's
                     // own cancellation — rethrow it so onCleared() actually stops the loop. (#125)
@@ -537,6 +515,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // and long-lived connection both come back without the user toggling the setting again.
         WhoopConnectionService.start(appContext)
         ble.reconnectToAddress(saved.first, saved.second)
+    }
+
+    /**
+     * One on-device scoring pass: read the imported raw samples and persist the computed
+     * recovery / strain / sleep / metric-series rows (under "<deviceId>-noop", merged back into the
+     * dashboard by [daysMergedFlow]). Shared by the launch + 15-min loop and by [analyzeImported].
+     * [maxDays] bounds how far back from today it scores (default = the recent window).
+     */
+    private suspend fun runAnalyzePass(maxDays: Int = ANALYZE_DEFAULT_MAX_DAYS) {
+        IntelligenceEngine.analyzeRecent(
+            repo = repository,
+            profile = currentProfile(),
+            maxDays = maxDays,
+            importedDeviceId = deviceId,
+            maxHROverride = profileStore.hrMaxOverride.takeIf { it > 0 }?.toDouble(),
+            // I2 read-through (Phase 1B-4): resolve the single owning device per day from the
+            // registry. A single-WHOOP install resolves to [deviceId] for every day, so the
+            // reads stay byte-identical; multi-source installs score each day from one source.
+            ownerSource = RegistryDayOwnerSource(noopApp.deviceRegistry),
+            // Steps-estimate calibration: feed the user's manual override in (null = auto-fit),
+            // and mirror the fitted/manual model back into ProfileStore so the Settings/Steps
+            // screen can show + adjust it. Mirrors the macOS engine writing into ProfileStore.
+            manualStepCoefficient = profileStore.stepsManualOverride,
+            persistStepsCalibration = { cal ->
+                profileStore.stepsCalibrationCoefficient = cal.coefficient
+                profileStore.stepsCalibrationSampleDays = cal.sampleDays
+                profileStore.stepsCalibrationConfidence = cal.confidence
+                profileStore.stepsCalibrationManual = cal.manual
+            },
+            // Manual "Recalibrate baseline" anchor (Settings → Charge advanced). The analytics
+            // layer is Context-free, so read the epoch (whole seconds, written as a Long by the
+            // button) here and thread it down — foldHistory drops every HRV night before it.
+            baselineEpoch = NoopPrefs.of(appContext)
+                .getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble(),
+        )
+    }
+
+    /**
+     * Recompute dashboard scores right now after a raw-capture import, instead of leaving the data
+     * dark until the 15-minute analyze loop fires (or the user restarts the app). The window is
+     * widened back to [sinceDay] (the import's oldest day) so an OLD historical capture is scored,
+     * not just the recent window. Fire-and-forget: [daysMergedFlow] republishes when it finishes.
+     */
+    fun analyzeImported(sinceDay: String?) {
+        viewModelScope.launch {
+            val days = analyzeWindowDays(sinceDay, LocalDate.now(java.time.ZoneOffset.UTC))
+            runCatching { runAnalyzePass(days) }
+                .onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+        }
     }
 
     /** Snapshot the user's body profile from SharedPreferences as an analytics [UserProfile]. */
@@ -1299,6 +1326,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         const val FIRST_OFFLOAD_GRACE_MS = 6_000L
         /** On-device scoring cadence — 15 min, matching the strap offload cadence. */
         const val ANALYZE_INTERVAL_MS = 15 * 60 * 1_000L
+        /** Default analyze look-back (days) — the recent window the loop scores each pass. */
+        const val ANALYZE_DEFAULT_MAX_DAYS = 21
         /** Daily re-arm cadence for the single-instant strap firmware alarm (secondary buzz cue). */
         const val STRAP_ALARM_REARM_INTERVAL_MS = 24 * 60 * 60 * 1_000L
         /** SharedPreferences key for the persisted double-tap action (stored as the enum NAME). */
@@ -1352,4 +1381,25 @@ internal fun zoneCoachBuzzLoops(previousZone: Int, zone: Int, recoveryEnabled: B
         zone <= 1 && previousZone > 1 && recoveryEnabled -> 1
         else -> 0
     }
+}
+
+/**
+ * How many days back from [today] an import-triggered analyze pass must cover so a freshly imported
+ * capture is actually scored. The recompute loop normally only looks at the recent [minDays] window;
+ * an OLD historical import (the whole point of the raw-capture importer) needs the window widened to
+ * reach its first imported day ([sinceDay], "yyyy-MM-dd"), plus a small buffer, clamped to [maxDays].
+ * A null/unparseable/future [sinceDay] falls back to [minDays] (never negative or zero).
+ */
+internal fun analyzeWindowDays(
+    sinceDay: String?,
+    today: LocalDate,
+    minDays: Int = 21,
+    maxDays: Int = 730,
+): Int {
+    val since = sinceDay?.let {
+        try { LocalDate.parse(it) } catch (_: DateTimeParseException) { null }
+    } ?: return minDays
+    val span = ChronoUnit.DAYS.between(since, today) // > 0 when sinceDay is in the past
+    if (span <= 0) return minDays
+    return (span + 2).coerceIn(minDays.toLong(), maxDays.toLong()).toInt()
 }
