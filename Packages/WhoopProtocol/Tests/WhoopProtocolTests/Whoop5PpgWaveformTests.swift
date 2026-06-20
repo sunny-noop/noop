@@ -45,26 +45,25 @@ final class Whoop5PpgWaveformTests: XCTestCase {
         XCTAssertEqual(p["unix"]?.intValue, 1780917232)        // real unix, same @15 slot as v18
         XCTAssertEqual(p["ppg_sample_count"]?.intValue, 24)
         XCTAssertEqual(p["ppg_waveform"]?.intArrayValue, expectedWaveform)
-        XCTAssertEqual(p["ppg_channel"]?.intValue, 1)          // channel index @21 (1 of the 26-channel sweep)
-        XCTAssert((1...26).contains(p["ppg_channel"]!.intValue!))   // guard-lock: never out of the 1…26 range
+        XCTAssertEqual(p["burst_index"]?.intValue, 1)          // @21 = per-session burst counter (this burst = 1)
     }
 
-    /// A second real v26 frame from the NEXT optical channel in the sweep, captured in a separate 40 s
-    /// burst ~19 min later. The strap time-multiplexes 26 channels (`@21` = 1…26), one per ~40-frame block.
-    /// This frame reads channel `2` (the first read `1`) — consecutive steps of the sweep. (An earlier
-    /// decode read `frame[12]` = 0x41/0x46 and mistook a high-entropy counter byte for the channel; those
-    /// values are out of the 1…26 range, which the guard now rejects.) Both channels' waveforms
-    /// autocorrelate to the heart rate (lag 14 ≈ 103 bpm); the physical LED mapping stays unclaimed.
+    /// A second real v26 frame from the NEXT optical burst, captured ~19 min later (one PIP cycle). `@21`
+    /// is NOT a channel: it is a per-session burst index — constant across all ~40 records of one burst,
+    /// +1 for each subsequent burst, reset to 1 when the optical engine restarts after a long idle. This
+    /// frame reads burst index `2` (the first read `1`) — the next burst in the same session. (An earlier
+    /// decode read `frame[12]` = 0x41/0x46 and mistook a high-entropy counter byte for it.) Both bursts'
+    /// waveforms autocorrelate to the heart rate (lag 14 ≈ 103 bpm).
     private let v26HexChannel46 =
         "aa015000010035412f1a803546840178a8266af54802004ca006007dfde1fde4fe9904" +
         "5009f40d7f0b380c5109e9013dff0dff19fd6efedafe8efe8cfca0fe98014002c9039f05" +
         "30059201d8abbe3d50080001006b6cb5a5"
 
-    func testV26SecondChannelDecodes() {
+    func testV26SecondBurstDecodes() {
         let p = parseFrame(bytes(v26HexChannel46), family: .whoop5).parsed
         XCTAssertEqual(p["hist_version"]?.intValue, 26)
         XCTAssertEqual(p["unix"]?.intValue, 1780918392)
-        XCTAssertEqual(p["ppg_channel"]?.intValue, 2)          // next channel in the 1…26 sweep (first frame read 1)
+        XCTAssertEqual(p["burst_index"]?.intValue, 2)          // next burst in the session (first frame read 1)
         XCTAssertEqual(p["ppg_sample_count"]?.intValue, 24)
         // Still a smooth pulsatile trace (guards the [27:75] bounds on the other channel too).
         let w = p["ppg_waveform"]!.intArrayValue!

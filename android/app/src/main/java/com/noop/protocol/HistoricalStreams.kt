@@ -320,7 +320,8 @@ private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
  *
  * Returns the record's wall-second [unix] and the 24 raw ADC [samples], or null when the frame is not
  * a v26 HISTORICAL_DATA record or the waveform region is truncated. The bytes before [27]
- * (header + optical-channel index @21) and the footer after [75] are intentionally not mapped here.
+ * (header + a per-session burst-index counter @21 — constant per ~40-record burst, +1 per burst, NOT a
+ * channel) and the footer after [75] are intentionally not mapped here.
  */
 private data class V26Record(val unix: Int, val samples: List<Int>)
 

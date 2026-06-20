@@ -455,14 +455,17 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
 /// as `ppg_waveform` with NO invented scale. The bytes before [27] (header + a block index) and the
 /// footer after [75] are not mapped; SpO₂/skin-temp have no internal proxy and are left untouched.
 private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder) {
-    // Optical channel index @21: the strap time-multiplexes 26 optical channels, sweeping 1→26 in
-    // ~40-frame blocks (one channel per block, revisited ~20 min later). Verified against a 22 h overnight
-    // corpus — frame[21] takes exactly 26 distinct values (1–26), and on our own two real fixtures reads
-    // 1 then 2. An earlier read at frame[12] (the 0x41/0x46 "two channels") was a high-entropy counter byte
-    // mistaken for the channel during a short 2-burst capture. Gate to 1…26 so a wrong offset stores nothing.
-    if let ch = readDType(frame, 21, "u8"), (1...26).contains(ch) {
-        fb.add(21, 1, "ppg_channel", "ppg", value: .int(ch),
-               note: "time-multiplexed optical channel 1–26 (40-frame blocks)")
+    // Burst index @21: NOT a channel. It is constant across all ~40 records of one optical burst,
+    // increments +1 for each subsequent burst, and resets to 1 when the optical engine restarts after a
+    // long idle gap — i.e. a per-session burst/sequence counter. Verified across a multi-day corpus:
+    // every burst carries a single @21 value, the value steps +1 per burst, and it climbs past 26 (to 72+)
+    // within one session. (An earlier read mistook this for a "26-channel sweep" because an over-tight
+    // 1…26 gate clamped the visible range; and an even earlier read at frame[12] = 0x41/0x46 mistook a
+    // high-entropy counter byte for it.) Stored as `burst_index` so it never masquerades as a PPG channel —
+    // the v26 waveform is a single 24 Hz cardiac channel.
+    if let bi = readDType(frame, 21, "u8"), bi > 0 {
+        fb.add(21, 1, "burst_index", "ppg", value: .int(bi),
+               note: "per-session optical burst counter (constant per burst, +1 per burst, resets on restart)")
     }
     if let unix = readDType(frame, 15, "u32") {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")

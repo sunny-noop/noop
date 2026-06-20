@@ -27,6 +27,22 @@ class SchemaTests(unittest.TestCase):
         df.apply_schema(c)  # second apply must not raise
         self.assertTrue(True)
 
+    def test_feat_ppg_has_burst_index_column(self):
+        c = _conn()
+        cols = {r[1] for r in c.execute("PRAGMA table_info(feat_ppg)")}
+        self.assertIn("burst_index", cols)
+
+    def test_migration_adds_burst_index_to_legacy_ppg(self):
+        # A pre-burst_index feat_ppg (older DB) gets the column added idempotently, like skin_temp_c.
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE feat_ppg (device_id INTEGER NOT NULL, unix INTEGER NOT NULL, "
+                  "sample_idx INTEGER NOT NULL, channel INTEGER NOT NULL, value INTEGER NOT NULL, "
+                  "PRIMARY KEY (device_id, unix, sample_idx, channel))")
+        df.apply_schema(c)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(feat_ppg)")}
+        self.assertIn("burst_index", cols)
+        df.apply_schema(c)  # second apply must not raise
+
 
 class RrStatsTests(unittest.TestCase):
     def test_empty(self):
@@ -78,11 +94,43 @@ class FeatureToRowsTests(unittest.TestCase):
         out = df.feature_to_rows(_rec(47, {"heart_rate": 0}))
         self.assertIsNone(out["second"]["hr"])
 
-    def test_v26_ppg_rows(self):
-        rec = _rec(47, {"ppg_waveform": [10, -20, 30], "ppg_channel": 65}, version=26)
+    def test_v26_ppg_maps_to_single_channel_zero(self):
+        # v26's `ppg_channel` field is @21 — a per-session BURST INDEX, not a channel. The waveform is one
+        # 24 Hz cardiac channel, so every v26 record must land on channel 0 regardless of @21. (Binning by
+        # @21 scattered ~60% of bursts into phantom channels the channel-0 HRV reader never read.)
+        rec = _rec(47, {"ppg_waveform": [10, -20, 30], "burst_index": 65}, version=26)
         out = df.feature_to_rows(rec)
         self.assertEqual(len(out["ppg"]), 3)
-        self.assertEqual(out["ppg"][0], {"unix": 1000, "sample_idx": 0, "channel": 65, "value": 10})
+        self.assertEqual(out["ppg"][0],
+                         {"unix": 1000, "sample_idx": 0, "channel": 0, "value": 10, "burst_index": 65})
+        self.assertTrue(all(r["channel"] == 0 for r in out["ppg"]))
+
+    def test_v26_carries_burst_index(self):
+        # @21 (`burst_index`) groups a burst's ~40 records and marks where one optical session ends (resets
+        # to 1) — carry it on every v26 PPG row so a future HRV pass can window per burst without re-deriving
+        # bursts from unix gaps.
+        out = df.feature_to_rows(_rec(47, {"ppg_waveform": [10, 20], "burst_index": 7}, version=26))
+        self.assertTrue(all(r["channel"] == 0 for r in out["ppg"]))
+        self.assertTrue(all(r["burst_index"] == 7 for r in out["ppg"]))
+
+    def test_v26_implausible_burst_index_nulled(self):
+        # @21 is a u8; the old 1…26 channel gate doubled as an offset-slip canary (a wrong offset stored
+        # nothing). The counter legitimately exceeds 26, so we re-gate loosely: a value outside 1..MAX is an
+        # implausible read → store NULL rather than a poisoned group id. Samples + channel 0 are still kept.
+        for bad in (0, 251, 255):
+            out = df.feature_to_rows(_rec(47, {"ppg_waveform": [1], "burst_index": bad}, version=26))
+            self.assertIsNone(out["ppg"][0]["burst_index"], f"burst_index {bad} must null")
+            self.assertEqual(out["ppg"][0]["channel"], 0)
+            self.assertEqual(out["ppg"][0]["value"], 1)
+
+    def test_v20_v21_multichannel_ppg_preserved(self):
+        # v20/v21 records carry genuine multi-channel optical PPG; their `ppg_channel` is a real channel
+        # index and must be kept (the fix is v26-specific, not a blanket force-to-0). They carry no @21
+        # burst counter, so burst_index is NULL on those rows.
+        for ver in (20, 21):
+            out = df.feature_to_rows(_rec(47, {"ppg_waveform": [5, 6], "ppg_channel": 3}, version=ver))
+            self.assertEqual(out["ppg"][0]["channel"], 3, f"v{ver} channel must be preserved")
+            self.assertIsNone(out["ppg"][0]["burst_index"], f"v{ver} has no burst_index")
 
     def test_event_named(self):
         rec = _rec(48, {"event": "WRIST_ON", "event_timestamp": 1000, "extra": 7}, unix=None)
@@ -123,6 +171,14 @@ class ApplyRowsTests(unittest.TestCase):
         self.assertEqual(c.execute("SELECT COUNT(*) FROM feat_rr").fetchone()[0], 2)
         self.assertEqual(c.execute("SELECT COUNT(*) FROM feat_ppg").fetchone()[0], 2)
         self.assertEqual(c.execute("SELECT kind FROM feat_event").fetchone()[0], "WRIST_ON")
+
+    def test_burst_index_persisted(self):
+        c = _conn()
+        mapped = [df.feature_to_rows(
+            _rec(47, {"ppg_waveform": [1, 2], "burst_index": 9}, unix=1001, version=26))]
+        df.apply_rows(c, 1, mapped)
+        rows = c.execute("SELECT burst_index FROM feat_ppg ORDER BY sample_idx").fetchall()
+        self.assertEqual([r[0] for r in rows], [9, 9])
 
     def test_idempotent(self):
         c = _conn()

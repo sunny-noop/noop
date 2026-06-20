@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS feat_rr (
 );
 CREATE TABLE IF NOT EXISTS feat_ppg (
     device_id INTEGER NOT NULL, unix INTEGER NOT NULL, sample_idx INTEGER NOT NULL,
-    channel INTEGER NOT NULL, value INTEGER NOT NULL,
+    channel INTEGER NOT NULL, value INTEGER NOT NULL, burst_index INTEGER,
     PRIMARY KEY (device_id, unix, sample_idx, channel)
 );
 CREATE TABLE IF NOT EXISTS feat_event (
@@ -46,6 +46,11 @@ def apply_schema(conn):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(feat_second)")}
     if "skin_temp_c" not in cols:
         conn.execute("ALTER TABLE feat_second ADD COLUMN skin_temp_c REAL")
+    # Idempotent migration: carry the v26 @21 burst counter (`burst_index`) on PPG rows for per-burst
+    # grouping; older DBs predate the column.
+    pcols = {r[1] for r in conn.execute("PRAGMA table_info(feat_ppg)")}
+    if "burst_index" not in pcols:
+        conn.execute("ALTER TABLE feat_ppg ADD COLUMN burst_index INTEGER")
     conn.commit()
 
 
@@ -70,6 +75,10 @@ def rr_stats(rr):
 # Inner packet types that carry per-second biometric records.
 _DATA_TYPES = (47, 40)   # HISTORICAL_DATA, REALTIME_DATA
 _EVENT_TYPE = 48
+# Loose sanity ceiling for the v26 @21 burst counter (a u8 that resets to 1 after idle). A night banks
+# ~25 bursts, observed up to ~72; a value beyond this is an implausible/offset-slipped read → drop to NULL
+# (the weak canary that replaces the old 1…26 channel gate).
+_V26_BURST_INDEX_MAX = 250
 
 
 def feature_to_rows(rec):
@@ -107,9 +116,22 @@ def feature_to_rows(rec):
         }
         for i, v in enumerate(rr):
             out["rr"].append({"unix": unix, "idx": i, "rr_ms": v})
-        ch = p.get("ppg_channel", 0)
+        # v26's `ppg_channel` is @21 — a per-session burst index, not a channel — so the waveform is one
+        # 24 Hz cardiac channel: force channel 0. (Binning by @21 scattered ~60% of bursts into phantom
+        # channels the channel-0 HRV reader never read.) v20/v21 carry real multi-channel PPG: keep theirs.
+        is_v26 = rec.get("version") == 26
+        ch = 0 if is_v26 else p.get("ppg_channel", 0)
+        # Carry @21 (`burst_index`) on the v26 rows so a future HRV pass can group samples into per-burst
+        # windows and spot where one optical session ends (the counter resets to 1) without re-deriving
+        # bursts from unix gaps. @21 is a u8; the old 1…26 channel gate doubled as an offset-slip canary
+        # (a wrong offset stored nothing). The counter legitimately exceeds 26, so re-gate loosely: a value
+        # outside 1..MAX is an implausible read → store NULL rather than a poisoned group id. Non-v26 PPG
+        # carries no burst counter.
+        bi = p.get("burst_index") if is_v26 else None
+        if bi is not None and not (1 <= bi <= _V26_BURST_INDEX_MAX):
+            bi = None
         for i, v in enumerate(p.get("ppg_waveform") or []):
-            out["ppg"].append({"unix": unix, "sample_idx": i, "channel": ch, "value": v})
+            out["ppg"].append({"unix": unix, "sample_idx": i, "channel": ch, "value": v, "burst_index": bi})
         return out
 
     if itype == _EVENT_TYPE:
@@ -150,9 +172,10 @@ def apply_rows(conn, device_id, mapped):
             cur.execute("INSERT OR IGNORE INTO feat_rr (device_id, unix, idx, rr_ms) VALUES (?,?,?,?)",
                         (device_id, r["unix"], r["idx"], r["rr_ms"]))
         for r in m.get("ppg", []):
-            cur.execute("INSERT OR IGNORE INTO feat_ppg (device_id, unix, sample_idx, channel, value) "
-                        "VALUES (?,?,?,?,?)",
-                        (device_id, r["unix"], r["sample_idx"], r["channel"], r["value"]))
+            cur.execute("INSERT OR IGNORE INTO feat_ppg "
+                        "(device_id, unix, sample_idx, channel, value, burst_index) VALUES (?,?,?,?,?,?)",
+                        (device_id, r["unix"], r["sample_idx"], r["channel"], r["value"],
+                         r.get("burst_index")))
         e = m.get("event")
         if e:
             cur.execute("INSERT OR IGNORE INTO feat_event (device_id, unix, kind, event_num, payload_json) "
