@@ -37,7 +37,7 @@ class TcpWatchLink(
     override fun publish(snapshot: WatchSnapshot) {
         if (role != WatchLinkRole.PUBLISHER || !running.get()) return
         ensurePublisherConnected()
-        val line = WatchSnapshotCodec.encode(snapshot) + "\n"
+        val line = WatchSnapshotCodec.encodeLine(snapshot)
         try {
             out?.apply { write(line.toByteArray(Charsets.UTF_8)); flush() }
         } catch (e: Exception) {

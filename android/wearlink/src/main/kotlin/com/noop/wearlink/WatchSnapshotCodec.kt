@@ -7,6 +7,12 @@ package com.noop.wearlink
  */
 object WatchSnapshotCodec {
 
+    /**
+     * One newline-terminated wire line for a snapshot — the single framing convention shared by
+     * every transport (TCP relay + Bluetooth RFCOMM). Read side splits on '\n'.
+     */
+    fun encodeLine(s: WatchSnapshot): String = encode(s) + "\n"
+
     fun encode(s: WatchSnapshot): String = buildString {
         append('{')
         append("\"hr\":").append(s.hr?.toString() ?: "null").append(',')

@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.util.Log
+import com.noop.wearlink.RfcommService
 import com.noop.wearlink.WatchLink
 import com.noop.wearlink.WatchSnapshot
 import com.noop.wearlink.WatchSnapshotCodec
@@ -13,14 +14,12 @@ import java.io.InputStreamReader
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** App-specific RFCOMM service UUID — must match the phone's BluetoothPublisherLink. */
-val WATCH_RFCOMM_UUID: UUID = UUID.fromString("7f3e2d1c-8b4a-4c9e-a1d6-0f5b2e9c3a47")
 private const val TAG = "WearBtSubscriber"
 private const val RECONNECT_DELAY_MS = 1500L
 
 /**
  * Watch-side [WatchLink] over Bluetooth RFCOMM: connects out to the bonded phone offering the
- * [WATCH_RFCOMM_UUID] service and reads line-delimited JSON snapshots. SUBSCRIBER role only.
+ * [RfcommService] UUID service and reads line-delimited JSON snapshots. SUBSCRIBER role only.
  * Requires an existing bond and BLUETOOTH_CONNECT (granted out-of-band for the PoC).
  */
 @SuppressLint("MissingPermission") // BLUETOOTH_CONNECT granted via adb for the PoC
@@ -71,7 +70,7 @@ class BluetoothSubscriberLink(context: Context) : WatchLink {
                 // connect() otherwise). RFCOMM connect to a bonded peer needs only BLUETOOTH_CONNECT.
                 // Insecure RFCOMM to match the phone's insecure server — a companion-app bond often
                 // won't carry a secure link key for third-party apps (secure connect → "read failed").
-                val s = device.createInsecureRfcommSocketToServiceRecord(WATCH_RFCOMM_UUID)
+                val s = device.createInsecureRfcommSocketToServiceRecord(UUID.fromString(RfcommService.UUID))
                 s.connect() // blocks; throws if this device isn't our server
                 return s
             } catch (e: Exception) {

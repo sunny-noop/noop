@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.util.Log
+import com.noop.wearlink.RfcommService
 import com.noop.wearlink.WatchLink
 import com.noop.wearlink.WatchSnapshot
 import com.noop.wearlink.WatchSnapshotCodec
@@ -13,9 +14,6 @@ import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** App-specific RFCOMM service UUID shared by the phone server and the watch client. */
-val WATCH_RFCOMM_UUID: UUID = UUID.fromString("7f3e2d1c-8b4a-4c9e-a1d6-0f5b2e9c3a47")
-private const val SDP_NAME = "noop-wear"
 private const val TAG = "WearBtPublisher"
 
 /**
@@ -48,7 +46,9 @@ class BluetoothPublisherLink(context: Context) : WatchLink {
                     // Insecure RFCOMM: a Wear<->phone bond made via the companion app often does not
                     // expose an authenticated (secure) link key to third-party apps, so the secure
                     // server/connect pair fails with "read failed". Insecure works over the same bond.
-                    val ss = a.listenUsingInsecureRfcommWithServiceRecord(SDP_NAME, WATCH_RFCOMM_UUID)
+                    val ss = a.listenUsingInsecureRfcommWithServiceRecord(
+                        RfcommService.SDP_NAME, UUID.fromString(RfcommService.UUID),
+                    )
                     serverSocket = ss
                     Log.d(TAG, "listening, awaiting watch…")
                     val c = ss.accept() // blocks until the watch connects
@@ -56,7 +56,14 @@ class BluetoothPublisherLink(context: Context) : WatchLink {
                     client = c
                     out = c.outputStream
                     Log.d(TAG, "watch connected: ${c.remoteDevice?.address}")
-                    while (running.get() && c.isConnected) Thread.sleep(500)
+                    // Block on the client's input so a disconnect (EOF / IOException) is detected
+                    // immediately — the watch never sends, so this parks until the socket closes.
+                    // Replaces a poll loop + the unreliable BluetoothSocket.isConnected.
+                    val input = c.inputStream
+                    val sink = ByteArray(64)
+                    while (running.get()) {
+                        if (input.read(sink) < 0) break // -1 = watch closed the socket
+                    }
                 } catch (e: Exception) {
                     Log.d(TAG, "accept loop: ${e.message}")
                 } finally {
@@ -72,7 +79,7 @@ class BluetoothPublisherLink(context: Context) : WatchLink {
         if (!running.get()) return
         ensureAccepting()
         val o = out ?: return // no watch yet — newest-wins, the next snapshot will reach it
-        val line = WatchSnapshotCodec.encode(snapshot) + "\n"
+        val line = WatchSnapshotCodec.encodeLine(snapshot)
         try {
             o.write(line.toByteArray(Charsets.UTF_8)); o.flush()
         } catch (e: Exception) {
