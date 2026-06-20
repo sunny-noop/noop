@@ -28,6 +28,11 @@ import com.noop.notif.BatteryAlertNotifier
 import com.noop.notif.IllnessAlertNotifier
 import com.noop.ui.NoopPrefs
 import com.noop.ui.appLaunchIntent
+import com.noop.wearbridge.BluetoothPublisherLink
+import com.noop.wearbridge.WearBridge
+import com.noop.wearbridge.WearPoc
+import com.noop.wearlink.TcpWatchLink
+import com.noop.wearlink.WatchLinkRole
 import com.noop.widget.WidgetSnapshot
 import com.noop.widget.WidgetSnapshotStore
 import kotlinx.coroutines.CoroutineScope
@@ -65,6 +70,22 @@ class WhoopConnectionService : Service() {
 
     /** Main-thread scope used only to mirror [LiveState] into the notification. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /** PoC-only: mirrors LiveState to a Wear watch over TCP. Null when the PoC is disabled. */
+    private val wearBridge: WearBridge? by lazy {
+        if (WearPoc.ENABLED) {
+            WearBridge(
+                state = ble.state,
+                link = when (WearPoc.TRANSPORT) {
+                    WearPoc.Transport.BLUETOOTH -> BluetoothPublisherLink(applicationContext)
+                    WearPoc.Transport.TCP ->
+                        TcpWatchLink(WearPoc.HOST, WearPoc.PORT, WatchLinkRole.PUBLISHER)
+                },
+            )
+        } else {
+            null
+        }
+    }
 
     /** The single live-state→notification collector. Re-`start`s land here repeatedly (on every
      *  connect, plus any OS restart), so we cancel the old one before launching a new one. */
@@ -220,6 +241,7 @@ class WhoopConnectionService : Service() {
                 }
             }
         }
+        wearBridge?.start(scope)
 
         // Drive GPS route tracking from here so it OUTLIVES the UI (#215). While a GPS workout is
         // active we collect the platform location stream into the process-level [GpsSession]; the
@@ -398,6 +420,7 @@ class WhoopConnectionService : Service() {
             runCatching { unregisterReceiver(bluetoothStateReceiver) }
             bluetoothReceiverRegistered = false
         }
+        wearBridge?.stop()
         scope.cancel()
         super.onDestroy()
     }

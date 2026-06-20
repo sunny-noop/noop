@@ -21,4 +21,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "NOOP"
-include(":app")
+include(":app", ":wear", ":wearlink")
