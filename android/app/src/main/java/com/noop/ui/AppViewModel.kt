@@ -683,8 +683,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         buzz(2)
         viewModelScope.launch {
             runCatching { repository.upsertWorkouts(listOf(row)) }
+            // Persist the live 1 Hz workout HR into hrSample so it exports to Health Connect at full
+            // resolution NOW (the HR export keeps workout-window samples un-decimated), instead of only
+            // after the next strap offload sync. IGNORE-on-conflict makes a later sync of the same
+            // seconds a no-op.
+            runCatching { if (samples.isNotEmpty()) repository.insertHr(samples) }
             if (_hcWriteback.value) {
                 runCatching { HealthConnectWriter.writeExercise(appContext, row, w.sport.exerciseType) }
+                // Export the just-captured HR series now (workout row already upserted above, so the
+                // export's window logic keeps these samples at full 1 Hz rather than ~1/30 s).
+                writebackHealthConnectNow()
             }
         }
     }

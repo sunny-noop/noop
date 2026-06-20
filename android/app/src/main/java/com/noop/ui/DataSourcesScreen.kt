@@ -441,10 +441,10 @@ fun DataSourcesScreen(vm: AppViewModel) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Share back to Health Connect", style = NoopType.subhead, color = Palette.textPrimary)
                         Text(
-                            "Write the nightly metrics NOOP computes from your strap (resting HR, " +
-                                "HRV, SpO₂, respiratory rate) into Health Connect so other apps can " +
-                                "use them. Only NOOP's own computed values — imported data is never " +
-                                "echoed back.",
+                            "Write the metrics NOOP computes from your strap (resting HR, HRV, SpO₂, " +
+                                "respiratory rate, active energy, heart rate, steps and sleep) into " +
+                                "Health Connect so other apps can use them. Only NOOP's own computed " +
+                                "values — imported data is never echoed back.",
                             style = NoopType.footnote,
                             color = Palette.textTertiary,
                         )

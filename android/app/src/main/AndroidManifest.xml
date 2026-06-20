@@ -90,6 +90,11 @@
     <uses-permission android:name="android.permission.health.WRITE_HEART_RATE_VARIABILITY" />
     <uses-permission android:name="android.permission.health.WRITE_OXYGEN_SATURATION" />
     <uses-permission android:name="android.permission.health.WRITE_RESPIRATORY_RATE" />
+    <!-- HR samples, steps, active calories, and sleep writeback (opt-in, default OFF). -->
+    <uses-permission android:name="android.permission.health.WRITE_ACTIVE_CALORIES_BURNED" />
+    <uses-permission android:name="android.permission.health.WRITE_STEPS" />
+    <uses-permission android:name="android.permission.health.WRITE_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.WRITE_SLEEP" />
     <!-- Exercise-session + distance writeback (GPS workouts, opt-in). MUST be declared or Health
          Connect silently drops the runtime request and live workouts never write back (#412). -->
     <uses-permission android:name="android.permission.health.WRITE_EXERCISE" />

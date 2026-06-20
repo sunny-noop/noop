@@ -269,6 +269,15 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_HC_WRITEBACK, enabled).apply()
     }
 
+    const val KEY_HC_HR_FRONTIER = "noop.hcHrFrontierTs"
+
+    /** Last HR sample epoch-second exported to Health Connect (0 = nothing exported yet). */
+    fun hcHrFrontier(context: Context): Long =
+        of(context).getLong(KEY_HC_HR_FRONTIER, 0L)
+
+    fun setHcHrFrontier(context: Context, tsSec: Long) =
+        of(context).edit().putLong(KEY_HC_HR_FRONTIER, tsSec).apply()
+
     /** Smart alarm: arm the strap's firmware alarm to buzz at a wake time. Default off; default time 07:00. */
     const val KEY_SMART_ALARM = "noop.smartAlarmEnabled"
     const val KEY_SMART_ALARM_MINUTES = "noop.smartAlarmMinutes"
