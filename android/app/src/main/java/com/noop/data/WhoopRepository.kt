@@ -25,11 +25,14 @@ data class StreamBatch(
     val steps: List<StepRow> = emptyList(),
     /** HR derived from the WHOOP 5/MG v26 optical PPG waveform (autocorrelation). (#156) */
     val ppgHr: List<PpgHrRow> = emptyList(),
+    /** Raw 24 Hz optical PPG waveform samples (the v26 grid) — kept alongside the derived [ppgHr] so a
+     *  beat-detection DSP can compute a spot RMSSD. One row per sample (24/sec). Empty on WHOOP 4. */
+    val ppgWaveform: List<PpgWaveformRow> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = hr.isEmpty() && rr.isEmpty() && events.isEmpty() && battery.isEmpty() &&
             spo2.isEmpty() && skinTemp.isEmpty() && resp.isEmpty() && gravity.isEmpty() &&
-            steps.isEmpty() && ppgHr.isEmpty()
+            steps.isEmpty() && ppgHr.isEmpty() && ppgWaveform.isEmpty()
 }
 
 // Device-agnostic decoded rows (deviceId attached when inserted). Mirror Streams.swift shapes.
@@ -52,6 +55,9 @@ data class RespRow(val ts: Long, val raw: Int)
 data class GravityRow(val ts: Long, val x: Double, val y: Double, val z: Double)
 /** HR derived from the v26 PPG waveform: [ts] window-centre sec, [bpm], [conf] in 0…1. (#156) */
 data class PpgHrRow(val ts: Long, val bpm: Int, val conf: Double)
+/** One raw v26 PPG-waveform sample: [ts] the record's wall-clock second, [sampleIdx] 0..23 within it,
+ *  [value] the raw i16 ADC count. deviceId attached on insert. */
+data class PpgWaveformRow(val ts: Long, val sampleIdx: Int, val value: Int)
 
 /** Count of rows ACTUALLY inserted per stream (mirrors WhoopStore.insert return tuple). */
 data class InsertCounts(
@@ -146,6 +152,14 @@ class WhoopRepository(private val dao: WhoopDao) {
         // backfill "persisted N" summary reflects HR recovered from the optical waveform too.
         val ppgHrIds = if (streams.ppgHr.isEmpty()) emptyList() else
             dao.insertPpgHr(streams.ppgHr.map { PpgHrSample(deviceId, it.ts, it.bpm, it.conf) })
+        // Raw v26 PPG waveform grid (one row per sample). Idempotent by (deviceId, ts, sampleIdx).
+        // Kept alongside the derived ppgHr above; NOT counted into InsertCounts (it's the input
+        // waveform, not a biometric stream the backfill summary reports).
+        if (streams.ppgWaveform.isNotEmpty()) {
+            dao.insertPpgWaveform(
+                streams.ppgWaveform.map { PpgWaveformSample(deviceId, it.ts, it.sampleIdx, it.value) },
+            )
+        }
 
         // OnConflictStrategy.IGNORE returns -1 for skipped (already-present) rows; count the inserts.
         return InsertCounts(
@@ -270,6 +284,9 @@ class WhoopRepository(private val dao: WhoopDao) {
     suspend fun updateSleepStages(deviceId: String, detectedStartTs: Long, stagesJSON: String): Int =
         dao.updateSleepStages(deviceId, detectedStartTs, stagesJSON)
     suspend fun upsertMetricSeries(rows: List<MetricSeriesRow>) = dao.upsertMetricSeries(rows)
+    /** Drop one (deviceId, day, key) metric-series point — used to clear stale computed values. */
+    suspend fun deleteMetricSeries(deviceId: String, day: String, key: String) =
+        dao.deleteMetricSeriesPoint(deviceId, day, key)
     suspend fun upsertJournal(rows: List<JournalEntry>) = dao.upsertJournal(rows)
     suspend fun upsertWorkouts(rows: List<WorkoutRow>) = dao.upsertWorkouts(rows)
     suspend fun upsertAppleDaily(rows: List<AppleDaily>) = dao.upsertAppleDaily(rows)
@@ -294,6 +311,10 @@ class WhoopRepository(private val dao: WhoopDao) {
     /** v26 PPG-derived HR samples (own stream) for the raw-sensor diagnostic export. (#156) */
     suspend fun ppgHrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.ppgHrSamples(deviceId, from, to, limit)
+
+    /** Raw 24 Hz optical PPG waveform rows in [from, to] (ascending) — the spot-HRV DSP input. */
+    suspend fun ppgWaveform(deviceId: String, from: Long, to: Long) =
+        dao.ppgWaveform(deviceId, from, to)
 
     /** Downsampled HR (mean bpm per [bucketSeconds]) for the strap, for the Today 24h trend chart. */
     suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =

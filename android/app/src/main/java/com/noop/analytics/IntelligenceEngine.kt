@@ -228,6 +228,10 @@ object IntelligenceEngine {
         // On-device RSA respiration estimates, unioned with imported respRateBpm below to seed the
         // resp baseline the recovery composite's wResp=0.05 term scores against.
         val nightlyRespByDay = LinkedHashMap<String, Double?>()
+        // Spot HRV (RMSSD ms) computed from a sparse 24 Hz optical PPG burst that lands inside the
+        // night's sleep — a strictly better recovery HRV input than the saturating offload R-R when a
+        // GOOD burst exists. Keyed by day; value = (rmssd, hr, deep). Only GOOD readings are kept.
+        val spotHrvByDay = LinkedHashMap<String, SpotHrvSelector.Selection>()
 
         // Floor `now` to LOCAL midnight (#277) so each `dayStart` lands on a local-day boundary and the
         // day keys are LOCAL calendar days, consistent with the dashboard's local "today" lookup. A
@@ -318,6 +322,18 @@ object IntelligenceEngine {
             nightlySkinByDay[day] = res.nightlySkinTempC
             nightlyRespByDay[day] = res.daily.respRateBpm
             scoredNights.add(res)
+
+            // Spot HRV from the night's optical PPG bursts. Reads the raw 24 Hz waveform over the night
+            // window and picks the burst inside the longest sustained low-HR sleep block (see
+            // SpotHrvSelector). Only a GOOD reading is kept; absent waveform / no qualifying burst → no
+            // entry (honest empty state). Cheap when there's no waveform (empty read returns fast).
+            val nightStages = res.sleepSessions.flatMap { it.stages }
+            if (nightStages.isNotEmpty()) {
+                val waveform = repo.ppgWaveform(owner, from, to)
+                if (waveform.isNotEmpty()) {
+                    SpotHrvSelector.select(nightStages, hr, waveform)?.let { spotHrvByDay[day] = it }
+                }
+            }
         }
 
         // ── Seed the baseline from the UNION of imported nightly history + the nightly
@@ -504,6 +520,30 @@ object IntelligenceEngine {
         if (dailies.isNotEmpty()) repo.upsertDailyMetrics(dailies)
         if (restRows.isNotEmpty()) repo.upsertMetricSeries(restRows)
 
+        // Spot HRV (PPG) metric series — only GOOD readings reached spotHrvByDay. Three keys per day:
+        // the RMSSD (ms), its spot HR (bpm), and a deep flag (1.0 inside a deep segment, else 0.0 =
+        // labelled "sleep"). The Today card reads these; absent ⇒ honest empty state. Cleared+rewritten
+        // over the recompute window so a re-scored day can't keep a stale value.
+        run {
+            val spotRows = ArrayList<MetricSeriesRow>()
+            for ((day, sel) in spotHrvByDay) {
+                val rmssd = sel.result.rmssd ?: continue
+                spotRows.add(MetricSeriesRow(computedId, day, "ppg_spot_rmssd", rmssd))
+                spotRows.add(MetricSeriesRow(computedId, day, "ppg_spot_rmssd_hr", sel.result.hr))
+                spotRows.add(MetricSeriesRow(computedId, day, "ppg_spot_rmssd_deep", if (sel.deep) 1.0 else 0.0))
+            }
+            // Clear any prior spot rows over the window first (a day that no longer has a GOOD burst
+            // must drop its old value, not keep it). Iterate the recompute days and delete the three
+            // keys; cheap (indexed delete-by-key).
+            for (offset in 0 until maxDays) {
+                val key = AnalyticsEngine.dayString(nowLocalMidnight - offset * SECONDS_PER_DAY, tzOffsetSeconds)
+                repo.deleteMetricSeries(computedId, key, "ppg_spot_rmssd")
+                repo.deleteMetricSeries(computedId, key, "ppg_spot_rmssd_hr")
+                repo.deleteMetricSeries(computedId, key, "ppg_spot_rmssd_deep")
+            }
+            if (spotRows.isNotEmpty()) repo.upsertMetricSeries(spotRows)
+        }
+
         // ── Fitness Age (Phase 2) — weekly, keyed to the week's Saturday ──
         val fa7 = dailies.sortedBy { it.day }.takeLast(7)
         val faRHRs = fa7.mapNotNull { it.restingHr }.map { it.toDouble() }
@@ -533,8 +573,14 @@ object IntelligenceEngine {
         // ≥3 inputs. VO₂max is omitted (fitness is Fitness Age's headline); Vitality leans on resting HR,
         // sleep duration + regularity, HRV-vs-age-norm, and steps.
         val vNights = fa7.mapNotNull { it.totalSleepMin }.map { it / 60.0 }.filter { it > 0 }
-        val vHRVs = fa7.mapNotNull { it.avgHrv }
         val vSteps = fa7.mapNotNull { it.steps }.map { it.toDouble() }
+        // HRV input: prefer the GOOD spot RMSSD per day (a real optical-PPG beat-detection reading)
+        // over the saturating offload-R-R avgHrv, falling back to avgHrv on days with no GOOD burst.
+        // Only changes a day's value when a GOOD spot reading exists, so the existing path is unchanged
+        // when no waveform/burst is present (no regression).
+        val vHRVs = fa7.mapNotNull { dm ->
+            spotHrvByDay[dm.day]?.result?.rmssd ?: dm.avgHrv
+        }
         val vInputs = VitalityEngine.Inputs(
             chronoAge = profile.age,
             restingHR = if (faRHRs.isEmpty()) null else medianOfDoubles(faRHRs),

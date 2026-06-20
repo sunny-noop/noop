@@ -71,6 +71,10 @@ interface WhoopDao : DeviceRegistryDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertPpgHr(rows: List<PpgHrSample>): List<Long>
 
+    /** Raw 24 Hz optical PPG waveform samples (the v26 grid). Idempotent by (deviceId, ts, sampleIdx). */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertPpgWaveform(rows: List<PpgWaveformSample>): List<Long>
+
     // MARK: - Server-derived caches (latest value wins)
 
     @Upsert
@@ -180,6 +184,14 @@ interface WhoopDao : DeviceRegistryDao {
             "ORDER BY ts ASC LIMIT :limit"
     )
     suspend fun ppgHrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<PpgHrSample>
+
+    /** Raw 24 Hz PPG waveform samples in [from, to] (ascending by second, then sample index) — the
+     *  per-second grid the spot-HRV DSP reconstructs and beat-detects over. */
+    @Query(
+        "SELECT * FROM ppgWaveformSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "ORDER BY ts ASC, sampleIdx ASC"
+    )
+    suspend fun ppgWaveform(deviceId: String, from: Long, to: Long): List<PpgWaveformSample>
 
     /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
      *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77). */

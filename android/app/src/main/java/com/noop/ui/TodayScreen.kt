@@ -318,6 +318,25 @@ fun TodayScreen(
         stepsEstForDay = byDay[selectedDayKey]?.let { Math.round(it).toInt() }
     }
 
+    // Spot HRV (PPG) for the selected day — a beat-detection RMSSD over a 24 Hz optical-PPG burst that
+    // landed inside the night's sleep. Stored as metricSeries under the computed "-noop" source; only
+    // GOOD readings were written, so a present value is, by construction, trustworthy. Null = no reading.
+    var spotHrv by remember { mutableStateOf<SpotHrvReading?>(null) }
+    LaunchedEffect(days, selectedDayKey) {
+        spotHrv = runCatching {
+            val computed = "my-whoop-noop"
+            suspend fun valueFor(key: String): Double? = viewModel.repo
+                .metricSeries(computed, key, selectedDayKey, selectedDayKey)
+                .firstOrNull()?.value
+            val rmssd = valueFor("ppg_spot_rmssd") ?: return@runCatching null
+            SpotHrvReading(
+                rmssdMs = rmssd.roundToInt(),
+                hrBpm = valueFor("ppg_spot_rmssd_hr")?.roundToInt(),
+                deep = (valueFor("ppg_spot_rmssd_deep") ?: 0.0) >= 0.5,
+            )
+        }.getOrNull()
+    }
+
     // The Rest SCORE (0–100) for the selected day — IntelligenceEngine's Rest composite, written to the
     // `sleep_performance` metric series. The Key-Metrics "Rest" tile shows THIS, with hours-in-bed kept
     // as the caption; the tile previously showed hours where the score belonged (#248). resolvedSeries
@@ -588,6 +607,9 @@ fun TodayScreen(
             onScoreInfo = openGuide,
         )
         HeartRateTrendCard(viewModel, days, selectedDay, todayDate, displayMetric, effortScale)
+        // Spot HRV (PPG) — only rendered when a GOOD optical-PPG burst landed in the night's sleep.
+        // Additive + clearly badged as a spot/estimate; it never replaces the day's headline HRV.
+        SpotHrvCard(spotHrv)
         TodayWorkoutsSection(footer.recentWorkouts)
         // Honest, dismissible 12-hourly donation ask — a card in the flow, never a dialog.
         DonationNudgeCard()
@@ -801,6 +823,67 @@ private fun ScoringGuideIntroCard(onOpen: () -> Unit, onDismiss: () -> Unit) {
                 TextButton(onClick = onOpen) {
                     Text("See how it works", style = NoopType.captionNumber, color = Palette.accent)
                 }
+            }
+        }
+    }
+}
+
+// MARK: - Spot HRV (PPG) card
+
+/** A GOOD spot-HRV reading for the selected day, loaded from the computed metric series. */
+data class SpotHrvReading(val rmssdMs: Int, val hrBpm: Int?, val deep: Boolean)
+
+/**
+ * "HRV (PPG spot)" recovery card. Renders ONLY when a GOOD reading exists — a beat-detection RMSSD
+ * over a sparse 24 Hz optical-PPG burst that landed inside the night's sleep. Carries an explicit
+ * *spot/estimate* badge and a sleep/deep label so it's never read as a continuous overnight HRV; it's
+ * additive and does not replace the day's headline HRV. When there is no reading (no burst landed in
+ * sleep, or none graded GOOD) the card shows an honest empty state rather than fabricating a number.
+ *
+ * This is a PPG-derived heart-rate-variability reading (R-R from detected beats) — NOT SpO2 (the
+ * waveform is AC-coupled, so no blood-oxygen value is implied).
+ */
+@Composable
+private fun SpotHrvCard(reading: SpotHrvReading?) {
+    NoopCard {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = null,
+                    tint = Palette.accent,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("HRV (PPG spot)", style = NoopType.headline, color = Palette.textPrimary)
+                Spacer(Modifier.weight(1f))
+                // Always-visible badge: this is a spot estimate, not a measured/continuous value.
+                Text("SPOT · ESTIMATE", style = NoopType.captionNumber, color = Palette.textTertiary)
+            }
+            if (reading != null) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text("${reading.rmssdMs}", style = NoopType.headline, color = Palette.textPrimary)
+                    Spacer(Modifier.width(4.dp))
+                    Text("ms", style = NoopType.subhead, color = Palette.textSecondary)
+                    Spacer(Modifier.weight(1f))
+                    val label = buildString {
+                        append(if (reading.deep) "deep sleep" else "sleep")
+                        reading.hrBpm?.let { append(" · ${it} bpm") }
+                    }
+                    Text(label, style = NoopType.subhead, color = Palette.textSecondary)
+                }
+                Text(
+                    "Estimated on-device from a short optical-pulse burst during sleep — a spot " +
+                        "reading that fills in when a continuous HRV isn't available.",
+                    style = NoopType.subhead,
+                    color = Palette.textTertiary,
+                )
+            } else {
+                Text(
+                    "No HRV reading available tonight — a clean pulse burst didn't land during sleep.",
+                    style = NoopType.subhead,
+                    color = Palette.textSecondary,
+                )
             }
         }
     }

@@ -66,6 +66,28 @@ data class PpgHrSample(
     val synced: Int = 0,
 )
 
+/**
+ * One raw sample of the WHOOP 5/MG **v26** optical PPG waveform — the on-wire 24 Hz waveform the
+ * strap banks in its sparse optical bursts. Each v26 record carries 24 ordered i16 samples for one
+ * whole second; this table keeps every sample (one row each) instead of discarding the grid after the
+ * derived per-second HR is computed, so a beat-detection DSP ([com.noop.analytics.SpotHrv]) can run a
+ * *spot* RMSSD over a burst that lands in sleep.
+ *
+ * Shape mirrors the Linux capture's `feat_ppg(unix, sample_idx, value)` so the same reconstruction +
+ * peak-detection math applies. There is only ONE waveform here (the single 24 Hz channel), so no
+ * channel column — every row is that channel. [ts] is the record's wall-clock second (the corrected
+ * unix); [sampleIdx] is 0..23, the sample's position within that second; [value] is the raw i16 ADC
+ * count. PK (deviceId, ts, sampleIdx) makes re-offload idempotent. v11_12 migration. Distinct from
+ * [PpgHrSample] (the derived HR) on purpose — this is the input waveform, that is the reduced output.
+ */
+@Entity(tableName = "ppgWaveformSample", primaryKeys = ["deviceId", "ts", "sampleIdx"])
+data class PpgWaveformSample(
+    val deviceId: String,
+    val ts: Long,
+    val sampleIdx: Int,
+    val value: Int,
+)
+
 /** One downsampled HR point — the bucket's start (unix seconds) + the mean bpm over it. Query
  *  result of [WhoopDao.hrBuckets], not a table. Mirrors the macOS `HRBucket`. */
 data class HrBucket(

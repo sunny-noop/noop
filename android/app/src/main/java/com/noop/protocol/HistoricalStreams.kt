@@ -484,6 +484,9 @@ fun extractHistoricalStreams(
     val battery = ArrayList<BatteryRow>()
     // v26 PPG samples accumulate across the chunk, then get turned into HR after the loop (#156).
     val ppgSamples = ArrayList<PpgHr.Sample>()
+    // The SAME v26 samples, kept as the raw (ts, sampleIdx, value) grid so a spot-HRV DSP can
+    // beat-detect over a burst. Additive — does not affect the HR derivation above/below.
+    val ppgWaveform = ArrayList<com.noop.data.PpgWaveformRow>()
 
     for (frame in rawFrames) {
         // Packet type byte: WHOOP 5/MG's longer puffin envelope puts it at frame[8]; WHOOP 4 at frame[4].
@@ -502,7 +505,12 @@ fun extractHistoricalStreams(
                 if (family == DeviceFamily.WHOOP5) {
                     decodeWhoop5HistoricalV26(frame)?.let { rec ->
                         val baseTs = correctedWall(rec.unix.toLong() and 0xFFFFFFFFL)
-                        for (v in rec.samples) ppgSamples.add(PpgHr.Sample(ts = baseTs, value = v))
+                        rec.samples.forEachIndexed { idx, v ->
+                            ppgSamples.add(PpgHr.Sample(ts = baseTs, value = v))
+                            // Keep the raw grid too: one row per sample, indexed by its position
+                            // within the second (0..23), so the DSP can reconstruct the 24 Hz stream.
+                            ppgWaveform.add(com.noop.data.PpgWaveformRow(ts = baseTs, sampleIdx = idx, value = v))
+                        }
                     }
                 }
                 // type-47 carries the strap RTC's real-unix seconds. Correct for a grossly-stale RTC
@@ -590,7 +598,7 @@ fun extractHistoricalStreams(
     return StreamBatch(
         hr = hr, rr = rr, events = events, battery = battery,
         spo2 = spo2, skinTemp = skinTemp, resp = resp, gravity = gravity, steps = steps,
-        ppgHr = ppgHr,
+        ppgHr = ppgHr, ppgWaveform = ppgWaveform,
     )
 }
 

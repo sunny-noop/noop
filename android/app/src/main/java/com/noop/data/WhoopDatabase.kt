@@ -42,11 +42,12 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DismissedSleep::class,
         AppleDaily::class,
         PpgHrSample::class,
+        PpgWaveformSample::class,
         PairedDeviceRow::class,
         DayOwnershipRow::class,
         LabMarkerRow::class,
     ],
-    version = 11,
+    version = 12,
     exportSchema = false,
 )
 abstract class WhoopDatabase : RoomDatabase() {
@@ -292,6 +293,34 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v11 -> v12: ADDITIVE — adds the `ppgWaveformSample` table: the raw 24 Hz optical PPG
+         * waveform samples the v26 records carry. Until now the strap's per-second 24-sample grid was
+         * reduced to a derived HR ([PpgHrSample]) and discarded; keeping it lets a beat-detection DSP
+         * compute a *spot* RMSSD over a burst. CREATE TABLE only (no existing data touched), so already-
+         * offloaded raw streams survive (the strap trims acked history and won't re-send it).
+         *
+         * The SQL MUST match Room's generated schema for [PpgWaveformSample] exactly — every column
+         * NOT NULL (Kotlin non-null, no SQL DEFAULT), `value`/`sampleIdx` INTEGER, composite PRIMARY KEY
+         * (deviceId, ts, sampleIdx) in declaration order. Mirrors MIGRATION_5_6 (the `ppgHrSample`
+         * table) precisely — the additive, no-destructive-fallback form: a mismatch throws loudly
+         * rather than silently wiping non-resendable strap history.
+         *
+         * Exposed as the [PPG_WAVEFORM_CREATE_SQL] constant so a plain-JVM unit test
+         * ([com.noop.data.PpgWaveformMigrationTest]) pins this shape WITHOUT Robolectric — edit the
+         * constant and the migration changes in lockstep.
+         */
+        internal val PPG_WAVEFORM_CREATE_SQL =
+            "CREATE TABLE IF NOT EXISTS `ppgWaveformSample` (`deviceId` TEXT NOT NULL, " +
+                "`ts` INTEGER NOT NULL, `sampleIdx` INTEGER NOT NULL, `value` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`deviceId`, `ts`, `sampleIdx`))"
+
+        internal val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(PPG_WAVEFORM_CREATE_SQL)
+            }
+        }
+
         private fun build(appContext: Context): WhoopDatabase =
             Room.databaseBuilder(appContext, WhoopDatabase::class.java, DB_NAME)
                 // Real additive migration — NO destructive fallback (see the class doc): with
@@ -300,7 +329,7 @@ abstract class WhoopDatabase : RoomDatabase() {
                 .addMigrations(
                     MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11,
+                    MIGRATION_10_11, MIGRATION_11_12,
                 )
                 .build()
     }
