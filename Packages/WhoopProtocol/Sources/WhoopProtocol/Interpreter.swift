@@ -464,8 +464,38 @@ private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder) {
         fb.add(21, 1, "ppg_channel", "ppg", value: .int(ch),
                note: "time-multiplexed optical channel 1–26 (40-frame blocks)")
     }
+    // Record index @11 (u32): the same per-record counter the v18 and v20/v21 records already decode at this
+    // offset (see those branches) — it just wasn't being read on v26.
+    if let idx = readDType(frame, 11, "u32") {
+        fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "per-record counter")
+    }
     if let unix = readDType(frame, 15, "u32") {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
+    }
+    // Segment value @19 (u16): constant across the records of one burst; its values are integer multiples of
+    // ~327.68 (= 32768 / 100), i.e. it encodes an integer 0…99.
+    if let seg = readDType(frame, 19, "u16") {
+        fb.add(19, 2, "segment_id", "meta", value: .int(seg),
+               note: "u16, constant across a burst; values are multiples of ~327.68 (encode an integer 0…99)")
+    }
+    // Further per-record optical fields around the waveform.
+    if let v = readDType(frame, 23, "u16") {
+        fb.add(23, 2, "frontend_meta", "optical", value: .int(v), note: "u16")
+    }
+    if let v = readDType(frame, 25, "u8") {
+        fb.add(25, 1, "subchannel_index", "optical", value: .int(v), note: "u8 (0…7)")
+    }
+    if let d = readF32(frame, 75), d.isFinite {
+        fb.add(75, 4, "signal_quality", "optical", value: .double(d), note: "float32")
+    }
+    if let v = readDType(frame, 79, "u16") {
+        fb.add(79, 2, "subchannel_config", "optical", value: .int(v), note: "u16")
+    }
+    if let v = readDType(frame, 81, "u8") {
+        fb.add(81, 1, "quality_flag_1", "optical", value: .int(v), note: "u8 (0/1)")
+    }
+    if let v = readDType(frame, 82, "u8") {
+        fb.add(82, 1, "quality_flag_2", "optical", value: .int(v), note: "u8 (0/1)")
     }
     var samples: [Int] = []
     for off in stride(from: 27, to: 75, by: 2) {

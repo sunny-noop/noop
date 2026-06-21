@@ -47,6 +47,16 @@ final class Whoop5PpgWaveformTests: XCTestCase {
         XCTAssertEqual(p["ppg_waveform"]?.intArrayValue, expectedWaveform)
         XCTAssertEqual(p["ppg_channel"]?.intValue, 1)          // channel index @21 (1 of the 26-channel sweep)
         XCTAssert((1...26).contains(p["ppg_channel"]!.intValue!))   // guard-lock: never out of the 1…26 range
+        XCTAssertEqual(p["record_index"]?.intValue, 25444781)  // per-record counter @11 (same slot as v18/v20-21)
+        XCTAssertEqual(p["segment_id"]?.intValue, 18350)       // @19
+        XCTAssertEqual(Int((Double(p["segment_id"]!.intValue!) / 327.68).rounded()), 56)  // 18350 ≈ 56 * 327.68
+        // Further per-record fields (raw values pinned).
+        XCTAssertEqual(p["frontend_meta"]?.intValue, 50627)
+        XCTAssertEqual(p["subchannel_index"]?.intValue, 5)
+        XCTAssertEqual(p["subchannel_config"]?.intValue, 2128)
+        XCTAssertEqual(p["quality_flag_1"]?.intValue, 1)
+        XCTAssertEqual(p["quality_flag_2"]?.intValue, 1)
+        XCTAssertNotNil(p["signal_quality"]?.doubleValue)
     }
 
     /// A second real v26 frame from the NEXT optical channel in the sweep, captured in a separate 40 s
@@ -66,6 +76,10 @@ final class Whoop5PpgWaveformTests: XCTestCase {
         XCTAssertEqual(p["unix"]?.intValue, 1780918392)
         XCTAssertEqual(p["ppg_channel"]?.intValue, 2)          // next channel in the 1…26 sweep (first frame read 1)
         XCTAssertEqual(p["ppg_sample_count"]?.intValue, 24)
+        // @19 segment value steps 56 -> 57 across these two consecutive bursts (the encoded integer 0…99 +1).
+        XCTAssertEqual(p["segment_id"]?.intValue, 18677)       // 18677 ≈ 57 * 327.68
+        XCTAssertEqual(Int((Double(p["segment_id"]!.intValue!) / 327.68).rounded()), 57)
+        XCTAssertEqual(p["record_index"]?.intValue, 25445941)  // per-record counter @11
         // Still a smooth pulsatile trace (guards the [27:75] bounds on the other channel too).
         let w = p["ppg_waveform"]!.intArrayValue!
         let range = w.max()! - w.min()!
