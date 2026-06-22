@@ -56,6 +56,22 @@ the same capture.
 ]}
 ```
 
+## 3. Score against a reference (objective, not just "looks plausible")
+The runner only produces hypnograms; to get a *number* you score them against a **reference hypnogram** —
+your own per-epoch stage labels for the same night, from a commercial sleep-stage reference (or PSG). The
+reference is bring-your-own and never an input to the stager; see **[REFERENCE.md](REFERENCE.md)** for what
+it is and how to build one. Then:
+
+```bash
+# v1.json / v2.json from step 2; reference.json built per REFERENCE.md
+python3 score.py --reference reference.json --hypno v1=v1.json --hypno v2=v2.json
+```
+
+`score.py` is standard-library only and bundles no data. It aligns everything to 30 s epochs over the
+reference's span and prints accuracy, macro-recall, **Cohen's kappa**, per-stage recall, a confusion
+matrix, and stage minutes for each candidate — plus the `v1 -> v2` change. Run it on your own night to
+confirm the win holds on your data; that is the proof, not the table below.
+
 ## Note on the recipe (n=1)
 This was validated by **capturing raw WHOOP 5 strap data and replaying the same recording offline through
 both stagers** (shipped v6.2.0 and v2), then scoring each per-epoch against a commercial sleep-stage
