@@ -58,7 +58,7 @@ the same capture.
 
 ## 3. Score against a reference (objective, not just "looks plausible")
 The runner only produces hypnograms; to get a *number* you score them against a **reference hypnogram** —
-your own per-epoch stage labels for the same night, from a commercial sleep-stage reference (or PSG). The
+your own per-epoch stage labels for the same night, from an externally-calibrated sleep-stage reference (or PSG). The
 reference is bring-your-own and never an input to the stager; see **[REFERENCE.md](REFERENCE.md)** for what
 it is and how to build one. Then:
 
@@ -74,8 +74,7 @@ confirm the win holds on your data; that is the proof, not the table below.
 
 ## Note on the recipe (n=1)
 This was validated by **capturing raw WHOOP 5 strap data and replaying the same recording offline through
-both stagers** (shipped v6.2.0 and v2), then scoring each per-epoch against a commercial sleep-stage
-reference (one subject, 7 nights). v2 raised agreement substantially over v1 (which collapses toward
+both stagers** (shipped v6.2.0 and v2), then scoring each per-epoch against an externally-calibrated sleep-stage reference (one subject, 7 nights). v2 raised agreement substantially over v1 (which collapses toward
 *light*). That result is **n=1** — the recipe's weights and window sizes need multi-subject validation
 before they can be trusted as general. This runner is the tool to gather that evidence: stage your own
 captures with both and compare.

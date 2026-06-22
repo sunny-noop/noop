@@ -2,7 +2,7 @@
 """Score a sleep-stager hypnogram against a reference hypnogram, per 30 s epoch.
 
 Bring-your-own-data: this depends on NO bundled dataset. Give it (1) a REFERENCE hypnogram — your own
-per-epoch stage labels from a commercial sleep-stage reference (see REFERENCE.md) — and (2) one or more
+per-epoch stage labels from an externally-calibrated sleep-stage reference (see REFERENCE.md) — and (2) one or more
 CANDIDATE hypnograms (e.g. the runner's v1 and v2 outputs). It aligns everything to fixed 30 s epochs
 over the reference's span and reports, for each candidate vs the same reference on the same epochs:
 accuracy, macro-recall, Cohen's kappa, per-stage recall, a confusion matrix, and stage minutes. With two

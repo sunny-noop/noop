@@ -11,8 +11,9 @@ is deliberate: a stager must be measured on *your* night against *your* labels, 
 ## What counts as a reference
 Any independent source of per-epoch stage labels for the night, for example:
 
-- A **commercial sleep-stage reference** — the staged hypnogram a commercial sleep platform produces for
-  that night, exported for your own account. This is the practical option most people already have.
+- An **externally-calibrated sleep-stage reference** — the per-night staging an independent, validated
+  sleep platform produces for that night, exported for your own account. This is the practical option most
+  people already have.
 - **Polysomnography (PSG)** — the clinical gold standard, if you have a study for the night.
 
 The only requirement is that it labels each part of the night as **deep / rem / light / awake** and
