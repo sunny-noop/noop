@@ -7,8 +7,9 @@ import WhoopProtocol
 ///
 /// Where the shipped stager runs a percentile-band classifier + median smoothing + physiology
 /// re-imposition over a Cole–Kripke actigraphy grid, V2 stages each epoch from per-night z-scored
-/// cardiorespiratory emissions, a soft sleep-cycle prior, an absolute peak-motion wake gate, an RR-RSA
-/// respiration-regularity term, and Viterbi/HMM smoothing.
+/// cardiorespiratory emissions, a soft sleep-cycle prior, a peak-motion wake gate scaled to each night's
+/// own quiescent jerk floor (so it's strap/fit-relative, not a fixed g), an RR-RSA respiration-regularity
+/// term, and Viterbi/HMM smoothing.
 ///
 /// Measured per-30 s-epoch against a commercial sleep-stage reference (one subject, 7 nights), V2 raises Cohen's kappa from
 /// ~0.06 (the shipped stager collapses to light) to ~0.47 — deep recall 12%→78%, REM 19%→67%.
@@ -21,13 +22,18 @@ public enum SleepStagerV2 {
     /// Same entry-point shape as `SleepStager.detectSleep`. Reuses the shipped session detection to find the
     /// in-bed spans, then re-stages each span with this recipe and recomputes efficiency from the new
     /// stages. `restingHR` / `avgHRV` are carried over from the shipped detection (computed identically).
+    /// `userFloor` (optional) is a per-user CALIBRATED quiescent jerk floor learned from the wearer's own
+    /// history (see the calibration-profile design): when supplied it replaces the per-night floor estimate
+    /// for every session, so a short/noisy night inherits the user's stable baseline. nil → per-night floor
+    /// (the default, no calibration required).
     public static func detectSleep(hr: [HRSample] = [],
                                    rr: [RRInterval] = [],
                                    resp: [RespSample] = [],
                                    gravity: [GravitySample],
                                    tzOffsetSeconds: Int = 0,
                                    wristOff: [(start: Int, end: Int)] = [],
-                                   bandSleepState: [(ts: Int, state: Int)] = []) -> [SleepSession] {
+                                   bandSleepState: [(ts: Int, state: Int)] = [],
+                                   userFloor: Double? = nil) -> [SleepSession] {
         let base = SleepStager.detectSleep(hr: hr, rr: rr, resp: resp, gravity: gravity,
                                            tzOffsetSeconds: tzOffsetSeconds, wristOff: wristOff,
                                            bandSleepState: bandSleepState)
@@ -37,7 +43,8 @@ public enum SleepStagerV2 {
         let rrS = rr.sorted { $0.ts < $1.ts }
         let respS = resp.sorted { $0.ts < $1.ts }
         return base.map { ses in
-            let stages = stageSession(start: ses.start, end: ses.end, grav: grav, hr: hrS, rr: rrS, resp: respS)
+            let stages = stageSession(start: ses.start, end: ses.end, grav: grav, hr: hrS, rr: rrS, resp: respS,
+                                      userFloor: userFloor)
             let eff = SleepStager.efficiency(start: ses.start, end: ses.end, stages: stages)
             return SleepSession(start: ses.start, end: ses.end, efficiency: eff,
                                 stages: stages, restingHR: ses.restingHR, avgHRV: ses.avgHRV)
@@ -50,8 +57,9 @@ public enum SleepStagerV2 {
     /// pre-onset / post-wake forcing. `resp` (raw resp ADC) is not consumed — respiration regularity is
     /// recovered from the R-R stream (RSA), the path available on both WHOOP 4 and 5.
     public static func stageSession(start: Int, end: Int, grav: [GravitySample],
-                                    hr: [HRSample], rr: [RRInterval], resp: [RespSample]) -> [StageSegment] {
-        let feats = features(start: start, end: end, grav: grav, hr: hr, rr: rr)
+                                    hr: [HRSample], rr: [RRInterval], resp: [RespSample],
+                                    userFloor: Double? = nil) -> [StageSegment] {
+        let feats = features(start: start, end: end, grav: grav, hr: hr, rr: rr, userFloor: userFloor)
         if feats.isEmpty { return [StageSegment(start: start, end: end, stage: "light")] }
         let labels = stageEpochs(feats)
 
@@ -77,7 +85,7 @@ public enum SleepStagerV2 {
     //   1. emission log-scores from z-scored HR / HR-variability / movement, with a per-night DEEP gate on
     //      the 11-min HR-flatness percentile (the strongest deep-vs-light separator observed in the data);
     //   2. a soft sleep-cycle prior — deep concentrated early, REM suppressed in the first ~12% then rising;
-    //   3. an absolute peak-motion (jerk) wake gate;
+    //   3. a peak-motion (jerk) wake gate, thresholded relative to the night's own quiescent jerk floor;
     //   4. an RR-RSA respiration-regularity term (regular breathing → deep, irregular → REM);
     //   5. Viterbi/HMM transition smoothing with a sticky transition matrix.
 
@@ -89,13 +97,18 @@ public enum SleepStagerV2 {
     /// Deep is eligible only in the night's lowest ~20 % HR-flatness epochs (≈ deep base rate + margin).
     static let deepGateThresh = 0.20
     static let deepGateSlope = 5.0
-    /// Absolute per-epoch peak-jerk (g) above which the epoch is wake-boosted (real wrist movement).
-    static let motionGateJerk = 0.03
+    /// Motion thresholds are expressed RELATIVE to each night's own quiescent jerk floor (the median
+    /// per-second gravity-jerk over the in-bed session, ≈ the still-sleep sensor floor, typically a few
+    /// ×10⁻⁴ g), NOT in absolute g. This self-calibrates to a strap's gravity-decode scale and the wearer's
+    /// fit instead of assuming a fixed g value — the one place the recipe otherwise carried a raw-units
+    /// constant. The multipliers sit a little tighter than the former fixed 0.02 g / 0.03 g; they were swept
+    /// to the joint optimum of per-epoch agreement with a commercial reference (one subject) AND inter-strap
+    /// agreement on a second subject's WHOOP-4/WHOOP-5 dual-wear, so they don't lean on either alone.
+    static let jerkFloorMoveMult = 38.0  // a per-second jerk counts as "moving" above floor × this
+    static let jerkFloorGateMult = 55.0  // wake-boost when an epoch's peak jerk exceeds floor × this
     static let motionGateBoost = 2.0
     /// Weight of the RSA respiration-regularity term (regular → deep, irregular → REM).
     static let respWeight = 0.6
-    /// Movement jerk (g) above which a sample counts as "moving" for the per-epoch move fraction.
-    static let jerkMoveThreshold = 0.02
     /// Transition matrix (rows = from, cols = to). Self-transitions dominate (stages persist over many
     /// 30 s epochs); deep↔rem rare; wake mostly to/from light. A priori, not fit.
     static let transition: [String: [String: Double]] = [
@@ -111,17 +124,46 @@ public enum SleepStagerV2 {
         let hr: Double?         // epoch-mean HR (bpm)
         let hrVar: Double?      // std of per-second HR over a centred 5-min window
         let hrFlat11: Double?   // std of per-second HR over a centred 11-min window (deep/light separator)
-        let moveFrac: Double    // fraction of in-epoch per-second jerks above jerkMoveThreshold
+        let moveFrac: Double    // fraction of in-epoch per-second jerks above the night-relative move threshold
         let jerkMax: Double     // peak in-epoch per-second jerk (g) — wake is bursty
         let respReg: Double?    // RSA spectral peakedness in the 0.15–0.40 Hz band (breathing regularity)
         let clock: Double       // time-of-night fraction in [0, 1]
+        let jerkScale: Double   // night quiescent jerk floor (median per-second jerk over the session)
+    }
+
+    /// The quiescent jerk floor of one session: the median per-second gravity-jerk over `[start, end)` (most
+    /// sleep seconds are still, so the median tracks the strap's noise/decode floor). The calibration trainer
+    /// calls this per detected session to update a user's profile; nil when the window has too little motion
+    /// data. This is the same quantity `features()` computes internally as the per-night floor.
+    public static func sessionJerkFloor(start: Int, end: Int, gravity: [GravitySample]) -> Double? {
+        if end <= start { return nil }
+        var gxSum = [Int: Double](), gySum = [Int: Double](), gzSum = [Int: Double](), gCnt = [Int: Int]()
+        for g in gravity where g.ts >= start && g.ts < end {
+            gxSum[g.ts, default: 0] += g.x; gySum[g.ts, default: 0] += g.y
+            gzSum[g.ts, default: 0] += g.z; gCnt[g.ts, default: 0] += 1
+        }
+        let secs = gCnt.keys.sorted()
+        if secs.count < 2 { return nil }
+        var jerks: [Double] = []; jerks.reserveCapacity(secs.count)
+        var prev: (Double, Double, Double)? = nil, prevSec = 0
+        for s in secs {
+            let d = Double(gCnt[s]!); let cur = (gxSum[s]! / d, gySum[s]! / d, gzSum[s]! / d)
+            if let p = prev, s - prevSec == 1 {
+                let dx = p.0 - cur.0, dy = p.1 - cur.1, dz = p.2 - cur.2
+                jerks.append((dx * dx + dy * dy + dz * dz).squareRoot())
+            }
+            prev = cur; prevSec = s
+        }
+        if jerks.isEmpty { return nil }
+        jerks.sort(); let n = jerks.count
+        return n % 2 == 1 ? jerks[n / 2] : 0.5 * (jerks[n / 2 - 1] + jerks[n / 2])
     }
 
     /// Build the per-epoch recipe features over a 30 s wall-clock-aligned grid covering [start, end].
     /// Streams are the FULL (un-clipped) sorted streams, so the 5-/11-min HR windows and the RSA beat
     /// window can reach across the session edges exactly as the reference pipeline does.
     static func features(start: Int, end: Int, grav: [GravitySample],
-                            hr: [HRSample], rr: [RRInterval]) -> [Epoch] {
+                            hr: [HRSample], rr: [RRInterval], userFloor: Double? = nil) -> [Epoch] {
         if end <= start { return [] }
         let span = Double(max(1, end - start))
 
@@ -152,7 +194,15 @@ public enum SleepStagerV2 {
             return v.squareRoot()
         }
 
-        var feats: [Epoch] = []
+        // PASS 1 — build every per-epoch quantity EXCEPT the move fraction, and pool every per-second jerk
+        // so the night's quiescent jerk floor (its median) can scale the motion thresholds. moveFrac needs
+        // that floor, which isn't known until the whole session has been scanned, hence the two passes.
+        struct Raw {
+            let start: Int; let hr: Double?; let hrVar: Double?; let hrFlat11: Double?
+            let jerks: [Double]; let gapSec: Int; let jerkMax: Double; let respReg: Double?; let clock: Double
+        }
+        var raws: [Raw] = []
+        var allJerks: [Double] = []
         let firstE = ((start + 29) / 30) * 30
         var e = firstE
         while e < end {
@@ -172,8 +222,7 @@ public enum SleepStagerV2 {
                 let dx = a.0 - b.0, dy = a.1 - b.1, dz = a.2 - b.2
                 jerks.append((dx * dx + dy * dy + dz * dz).squareRoot())
             }
-            let moves = jerks.reduce(0) { $0 + ($1 > jerkMoveThreshold ? 1 : 0) }
-            let moveFrac = Double(moves) / Double(max(1, gseq.count - 1))
+            allJerks.append(contentsOf: jerks)
             let jerkMax = jerks.max() ?? 0.0
 
             let hrMean = hrs.isEmpty ? nil : hrs.reduce(0, +) / Double(hrs.count)
@@ -188,11 +237,33 @@ public enum SleepStagerV2 {
             beats.sort { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
             let respReg = respRegularity(beats)
 
-            feats.append(Epoch(
-                start: e, hr: hrMean, hrVar: hrVar, hrFlat11: hrFlat11,
-                moveFrac: moveFrac, jerkMax: jerkMax, respReg: respReg,
-                clock: Double(e + 15 - start) / span))
+            raws.append(Raw(start: e, hr: hrMean, hrVar: hrVar, hrFlat11: hrFlat11,
+                            jerks: jerks, gapSec: max(1, gseq.count - 1), jerkMax: jerkMax,
+                            respReg: respReg, clock: Double(e + 15 - start) / span))
             e += 30
+        }
+
+        // Night quiescent jerk floor = median of all per-second jerks (most seconds of sleep are still, so
+        // the median tracks the strap's noise/decode floor, not the night's restlessness). Tiny epsilon when
+        // there's no motion data so the move threshold collapses to ~0 rather than dividing by nothing.
+        let jerkScale: Double = {
+            if let uf = userFloor { return uf }     // calibrated per-user floor (nil → per-night median below)
+            if allJerks.isEmpty { return 1e-6 }
+            let s = allJerks.sorted(); let n = s.count
+            return n % 2 == 1 ? s[n / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2])
+        }()
+        let moveThr = jerkScale * jerkFloorMoveMult
+
+        // PASS 2 — move fraction against the night-relative threshold; carry the floor on each epoch so the
+        // wake gate in stageEpochs() can be night-relative too.
+        var feats: [Epoch] = []
+        feats.reserveCapacity(raws.count)
+        for r in raws {
+            let moves = r.jerks.reduce(0) { $0 + ($1 > moveThr ? 1 : 0) }
+            feats.append(Epoch(
+                start: r.start, hr: r.hr, hrVar: r.hrVar, hrFlat11: r.hrFlat11,
+                moveFrac: Double(moves) / Double(r.gapSec), jerkMax: r.jerkMax, respReg: r.respReg,
+                clock: r.clock, jerkScale: jerkScale))
         }
         return feats
     }
@@ -314,7 +385,7 @@ public enum SleepStagerV2 {
             ]
             let pr = cyclePrior(f.clock)
             for s in stageNames { em[s]! += pr[s]! }
-            if f.jerkMax > motionGateJerk { em["awake"]! += motionGateBoost }
+            if f.jerkMax > f.jerkScale * jerkFloorGateMult { em["awake"]! += motionGateBoost }
             if let rg = f.respReg { let z = zrg(rg); em["deep"]! += respWeight * z; em["rem"]! -= respWeight * z }
             seq.append(em)
         }
