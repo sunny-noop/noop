@@ -13,17 +13,23 @@ app build or CI. It depends on the `StrandAnalytics` package and uses its public
 macOS (where the app and its tests build).
 
 ## 1. Get a capture
-The runner reads **either** input, auto-detected — so the easiest path needs no conversion:
+The runner reads **any** of these, auto-detected — so the easiest path needs no conversion:
 
-- **A raw-capture export from the noop app** (JSONL, one frame per line). Export it on-device, then point
-  the runner straight at the file. *(This is how anyone can test on their own strap's data.)*
+- **A raw-sensor CSV from the noop app** — Settings → **Export raw sensor data (CSV)**. The decoded
+  long-format stream dump (heart rate, R-R, accelerometer, respiration …). Simplest way to test on **your
+  own night**, and the only raw export a **WHOOP 4.0 on Android** can produce. Export on-device (keeps the
+  last ~24 h) and point the runner straight at the file.
+- **A raw-frame export from the noop app** (JSONL, one frame per line). Export it on-device, then point
+  the runner straight at the file.
 - **A `capture.json`** — a JSON array of `{"hex","char"}` records, e.g. from the Linux capture tool:
   ```bash
   python3 tools/linux-capture/whoop_sync.py export --db captures/whoop.db --address <MAC> --out capture.json
   ```
 
-Either way the frames are raw strap frames. Family is auto-detected per frame from the source
-characteristic UUID (`fd4b…` → whoop5, `6108…` → whoop4); pass `whoop4`/`whoop5` to force it.
+The CSV is already decoded streams; the other two are raw strap frames (decoded here the same way the app
+does). For the frame inputs, family is auto-detected per frame from the source characteristic UUID
+(`fd4b…` → whoop5, `6108…` → whoop4); pass `whoop4`/`whoop5` to force it. The CSV needs no family. Either
+way both stagers see the same streams, so a phone CSV and a frame capture stage through identical logic.
 
 ## 2. Build and run both stagers
 ```bash
@@ -31,11 +37,11 @@ cd tools/sleep-stager-tester/runner
 swift build -c release
 BIN="$(find .build -name sleep-stager-cli -type f | head -1)"
 
-# INPUT can be the noop app export (.jsonl) OR a capture.json — auto-detected.
+# INPUT can be the raw-sensor CSV, a raw-frame export (.jsonl), or a capture.json — auto-detected.
 # v1 — shipped SleepStager:
-"$BIN" /path/to/noop-raw-capture-*.jsonl auto --stager v1 > v1.json
+"$BIN" /path/to/noop-raw-sensors.csv auto --stager v1 > v1.json
 # v2 — SleepStagerV2 recipe:
-"$BIN" /path/to/noop-raw-capture-*.jsonl auto --stager v2 > v2.json
+"$BIN" /path/to/noop-raw-sensors.csv auto --stager v2 > v2.json
 ```
 
 Each run writes the hypnogram JSON to stdout and a one-line per-session summary to stderr, e.g.:
