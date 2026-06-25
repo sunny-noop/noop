@@ -51,6 +51,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.DaytimeStress
+import com.noop.analytics.StressEngine
+import com.noop.ble.PuffinExperiment
 import com.noop.data.DailyMetric
 import java.util.Locale
 import kotlin.math.exp
@@ -96,25 +98,40 @@ fun StressScreen(vm: AppViewModel, onBreathe: () -> Unit = {}) {
         storedLoaded = true
     }
 
-    // Today's intraday stress read (hourly timeline + sustained-high flag), from the day's
-    // banked HR + R-R via the SAME 0–3 proxy the daily score uses. Null until the read
-    // completes; DaytimeStress.Result.EMPTY when the day has no usable intraday HR.
+    // Opt-in (Settings → Experimental "stress engine"): when on, the WHOLE Stress monitor is driven by
+    // the per-user calibrated StressEngine — the live hero score is a recent-window (~15 min) read, and
+    // the intraday timeline + the daily trend are re-scored from raw HR against the wearer's own baseline.
+    // Off → the shipped DaytimeStress intraday + the stored daily score (unchanged).
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val useEngine = remember { PuffinExperiment.from(context).experimentalStressEngine }
+
     var daytime by remember { mutableStateOf<DaytimeStress.Result?>(null) }
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        daytime = runCatching { loadDaytimeStress(vm) }.getOrDefault(DaytimeStress.Result.EMPTY)
+    var engine by remember { mutableStateOf<EngineBundle?>(null) }
+    androidx.compose.runtime.LaunchedEffect(useEngine) {
+        if (useEngine) {
+            val e = runCatching { computeEngine(vm) }.getOrNull()
+            engine = e
+            daytime = e?.today ?: DaytimeStress.Result.EMPTY
+        } else {
+            daytime = runCatching { loadDaytimeStress(vm) }.getOrDefault(DaytimeStress.Result.EMPTY)
+        }
     }
 
-    // Rebuild the model only when the inputs (days, stored) actually change — the
-    // derivation is O(n) over the full history, so we memoize on the inputs.
-    val model = remember(days, stored) { StressModel.build(days, stored) }
+    // When the engine drives it: trend = its per-day means, hero = its live (~15 min) score. Else stored.
+    val effectiveStored = if (useEngine) engine?.trend else stored
+    val liveOverride = if (useEngine) engine?.liveScore?.takeIf { !it.isNaN() } else null
+    val model = remember(days, effectiveStored, liveOverride) {
+        effectiveStored?.let { StressModel.build(days, it, liveOverride) }
+    }
+    val ready = if (useEngine) engine != null else storedLoaded
 
     LazyScreenScaffold(
         title = "Stress",
         subtitle = "Autonomic load from HRV and resting heart rate",
     ) {
         when {
-            model != null -> StressContent(model, daytime, onBreathe)
-            !storedLoaded -> item { StressLoading() }
+            model != null -> StressContent(model, daytime, onBreathe, useEngine)
+            !ready -> item { StressLoading() }
             else -> item { StressEmpty() }
         }
     }
@@ -138,6 +155,97 @@ private suspend fun loadDaytimeStress(vm: AppViewModel): DaytimeStress.Result {
     return DaytimeStress.analyze(hr, rr, tzOffsetSeconds)
 }
 
+/** Everything the calibrated Stress monitor renders from (opt-in engine path). */
+private class EngineBundle(
+    val today: DaytimeStress.Result,   // intraday timeline (hourly), today
+    val liveScore: Double,             // live recent-window (~15 min) hero score; NaN when no recent HR
+    val trend: Map<String, Double>,    // per-day calibrated daily mean, keyed "yyyy-MM-dd"
+)
+
+/**
+ * Opt-in calibrated path (Settings → Experimental "stress engine"): drive the WHOLE Stress monitor from
+ * [StressEngine] instead of DaytimeStress + the stored daily series. One ~30-day 5-min HR-bucket load
+ * yields the per-user between-night HR baseline AND the per-day trend; today's intraday line is built
+ * from per-minute HR. The hero/live score is the mean of the last ~15 min of the (EWMA-smoothed) series
+ * — a recent read, NOT a whole-day mean. Baseline is TRAINED once enough nights exist,
+ * else the per-hardware cold-start (modelKey only affects that fallback; whoop5 is the safe default).
+ */
+private suspend fun computeEngine(vm: AppViewModel): EngineBundle {
+    val now = System.currentTimeMillis() / 1000L
+    val tz = java.util.TimeZone.getDefault()
+    val tzOff = tz.getOffset(now * 1_000L) / 1_000L
+
+    val buckets = vm.repo.hrBuckets("my-whoop", now - 31L * 86_400L, now, 300L)
+    val byNight = HashMap<Long, MutableList<Double>>()
+    for (b in buckets) {
+        byNight.getOrPut(Math.floorDiv(b.bucket * 300L - 43_200L, 86_400L)) { ArrayList() }.add(b.avgBpm)
+    }
+    val hrByNight = byNight.entries.filter { it.value.isNotEmpty() }.map { it.key to it.value.average() }
+    val hrBase = StressEngine.resolveBaselines(hrByNight, modelKey = "whoop5").baseline
+
+    // Today's intraday from per-minute HR; live score = mean of the last ~15 min of the series.
+    val localNow = now + tzOff
+    val from = (localNow - Math.floorMod(localNow, 86_400L)) - tzOff
+    val hr = vm.repo.hrSamples("my-whoop", from, now, limit = 200_000)
+    var today = DaytimeStress.Result.EMPTY
+    var live = Double.NaN
+    if (hr.size >= DaytimeStress.minHourHrSamples) {
+        val series = StressEngine.scoreSeries(StressEngine.minuteFeatures(hr), hrBase)
+        today = adaptToDaytime(series, tzOff)
+        val lastTs = series.lastOrNull()?.ts
+        if (lastTs != null) {
+            val recent = series.filter { it.ts >= lastTs - 15L * 60L }
+            if (recent.isNotEmpty()) live = recent.map { it.level }.average()
+        }
+    }
+
+    // Per-day trend: waking-window (06–22 local) mean of the calibrated series, from the 5-min buckets.
+    val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply { timeZone = tz }
+    val byDay = sortedMapOf<String, MutableList<Pair<Long, Double>>>()
+    for (b in buckets) {
+        val ts = b.bucket * 300L
+        byDay.getOrPut(fmt.format(java.util.Date(ts * 1_000L))) { ArrayList() }.add(ts to b.avgBpm)
+    }
+    val trend = HashMap<String, Double>()
+    for ((day, pts) in byDay) {
+        val s = pts.sortedBy { it.first }
+        val mins = LongArray(s.size) { s[it].first }
+        val hrArr = Array<Double?>(s.size) { s[it].second }
+        val series = StressEngine.scoreSeries(StressEngine.Features(mins, hrArr), hrBase)
+        val waking = series.filter {
+            val h = Math.floorMod(Math.floorDiv(it.ts + tzOff, 3_600L), 24L).toInt()
+            h in DaytimeStress.wakingStartHour until DaytimeStress.wakingEndHour
+        }
+        if (waking.isNotEmpty()) trend[day] = waking.map { it.level }.average()
+    }
+    return EngineBundle(today, live, trend)
+}
+
+/** Aggregate the calibrated per-minute series into the hourly [DaytimeStress.Result] shape the Stress
+ *  screen renders: same waking window (06–22 local) and sustained-high run logic, calibrated levels. */
+private fun adaptToDaytime(series: List<StressEngine.MinutePoint>, tzOffsetSeconds: Long): DaytimeStress.Result {
+    if (series.isEmpty()) return DaytimeStress.Result.EMPTY
+    val byHour = sortedMapOf<Long, MutableList<Double>>()   // wall-clock bucket start -> levels
+    for (p in series) {
+        val localTs = p.ts + tzOffsetSeconds
+        val hod = Math.floorMod(Math.floorDiv(localTs, 3_600L), 24L).toInt()
+        if (hod < DaytimeStress.wakingStartHour || hod >= DaytimeStress.wakingEndHour) continue
+        val bucketWall = Math.floorDiv(localTs, 3_600L) * 3_600L - tzOffsetSeconds
+        byHour.getOrPut(bucketWall) { ArrayList() }.add(p.level)
+    }
+    if (byHour.isEmpty()) return DaytimeStress.Result.EMPTY
+    val hours = byHour.map { (wall, lv) ->
+        val hod = Math.floorMod(Math.floorDiv(wall + tzOffsetSeconds, 3_600L), 24L).toInt()
+        DaytimeStress.HourPoint(hour = hod, startTs = wall, level = lv.average(), meanHr = null, rmssd = null)
+    }
+    val scored = hours.mapNotNull { p -> p.level?.let { p to it } }
+    var run = 0
+    for ((_, lvl) in scored.asReversed()) { if (lvl >= DaytimeStress.highBandFloor) run++ else break }
+    val dayMean = if (scored.isEmpty()) null else scored.map { it.second }.average()
+    val peak = scored.maxByOrNull { it.second }?.first
+    return DaytimeStress.Result(hours, run >= DaytimeStress.sustainedHours, run, dayMean, peak)
+}
+
 // MARK: - Loaded content
 
 // PERF (#scroll-jank): a [LazyListScope] extension so the 5 sections build lazily under
@@ -148,6 +256,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.StressContent(
     model: StressModel,
     daytime: DaytimeStress.Result?,
     onBreathe: () -> Unit,
+    useEngine: Boolean = false,
 ) {
     // 1 · HERO — the count-up PipBar + band + one plain-English line, all in one card
     //     (the needle/semicircle gauge is gone, matching the iOS redesign: a big WHITE
@@ -169,7 +278,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.StressContent(
     // 3 · Today's intraday timeline — when in the day stress ran high, + a passive Breathe
     //     suggestion when the recent hours stay elevated.
     if (daytime != null && daytime.scored.isNotEmpty()) {
-        item { StressDaytimeSection(daytime, onBreathe, modifier = Modifier.staggeredAppear(2)) }
+        item { StressDaytimeSection(daytime, onBreathe, modifier = Modifier.staggeredAppear(2), useEngine = useEngine) }
     }
 
     // 4 · Trend over the chosen window.
@@ -261,6 +370,7 @@ private fun StressDaytimeSection(
     day: DaytimeStress.Result,
     onBreathe: () -> Unit,
     modifier: Modifier = Modifier,
+    useEngine: Boolean = false,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader("Today's Timeline", overline = "Intraday", trailing = timelineTrailing(day))
@@ -302,9 +412,14 @@ private fun StressDaytimeSection(
                 }
 
                 Text(
-                    "The line traces your autonomic load across the waking day, scored " +
-                        "against your own calm hours today — the same 0–3 proxy as the score " +
-                        "above, read hour by hour. Hours without enough data are skipped.",
+                    if (useEngine)
+                        "The line traces your autonomic load across the waking day, scored against " +
+                            "your own baseline (your typical resting heart rate), read hour by hour — " +
+                            "the same 0–3 proxy as the score above. Hours without enough data are skipped."
+                    else
+                        "The line traces your autonomic load across the waking day, scored " +
+                            "against your own calm hours today — the same 0–3 proxy as the score " +
+                            "above, read hour by hour. Hours without enough data are skipped.",
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
                 )
@@ -1013,8 +1128,10 @@ private class StressModel private constructor(
 
     companion object {
         /** Build from oldest→newest daily metrics plus any stored "stress" series.
-         *  Returns null only when there is no usable signal at all. */
-        fun build(days: List<DailyMetric>, stored: Map<String, Double>): StressModel? {
+         *  Returns null only when there is no usable signal at all.
+         *  [liveOverride] (opt-in calibrated engine): when non-null it replaces the HERO/current score
+         *  with a live recent-window value (≈last 15 min), while the trend stays per-day. */
+        fun build(days: List<DailyMetric>, stored: Map<String, Double>, liveOverride: Double? = null): StressModel? {
             val today = days.lastOrNull() ?: return null
 
             // Baseline window: up to 30 days ending the day BEFORE today, so "today" is
@@ -1035,7 +1152,7 @@ private class StressModel private constructor(
 
             val derivedAvailable = (rhrT != null && meanRHR != null) || (hrvT != null && meanHRV != null)
             val storedToday = stored[today.day]
-            if (storedToday == null && !derivedAvailable) return null
+            if (storedToday == null && !derivedAvailable && liveOverride == null) return null
 
             val derivedToday: Double? = if (derivedAvailable) {
                 squash(rawScore(rhrT, meanRHR, sdRHR, hrvT, meanHRV, sdHRV))
@@ -1043,8 +1160,10 @@ private class StressModel private constructor(
                 null
             }
 
-            val s = storedToday ?: derivedToday ?: 1.5
-            val usingStored = storedToday != null
+            // Hero/current score: the live recent-window value when the calibrated engine drives it,
+            // else today's stored/derived daily value.
+            val s = liveOverride?.coerceIn(0.0, 3.0) ?: storedToday ?: derivedToday ?: 1.5
+            val usingStored = liveOverride == null && storedToday != null
             val band = StressBand.forScore(s)
             val rhrDelta = if (rhrT != null && meanRHR != null) rhrT - meanRHR else null
             val hrvDelta = if (hrvT != null && meanHRV != null) hrvT - meanHRV else null

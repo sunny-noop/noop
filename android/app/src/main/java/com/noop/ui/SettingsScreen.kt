@@ -329,6 +329,9 @@ fun SettingsScreen(vm: AppViewModel) {
     // Opt-in "Experimental sleep staging (V2)" (off by default). Model-agnostic, so it lives outside the
     // 5/MG-only card — it works on WHOOP 4 and 5. Re-stages detected nights with SleepStagerV2; V1 default.
     var experimentalSleepV2 by remember { mutableStateOf(puffinExperiment.experimentalSleepV2) }
+    // Opt-in "Experimental stress engine (calibrated)" (off by default). Model-agnostic. Re-scores the
+    // intraday Stress timeline with the per-user-calibrated StressEngine; default DaytimeStress otherwise.
+    var experimentalStressEngine by remember { mutableStateOf(puffinExperiment.experimentalStressEngine) }
 
     // Whether to surface the WHOOP 5/MG-only probes (puffin / R22 / broadcast-HR / frame-capture). Gated
     // so a confident 4.0 owner never sees 5/MG controls that can't touch their strap (#22). The model
@@ -1407,6 +1410,46 @@ fun SettingsScreen(vm: AppViewModel) {
                         "default staging. Opt-in and experimental — it only changes how already-detected " +
                         "nights are split into stages (detection and scores are unchanged), and the default " +
                         "staging stays in place if you leave this off. Takes effect on the next nights staged.",
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
+
+                // --- Experimental stress engine (calibrated) — opt-in, default OFF, every model. ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        "Experimental stress engine (calibrated)",
+                        style = NoopType.subhead,
+                        color = Palette.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = experimentalStressEngine,
+                        onCheckedChange = {
+                            experimentalStressEngine = it
+                            puffinExperiment.experimentalStressEngine = it
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                        modifier = Modifier.semantics {
+                            contentDescription = "Experimental stress engine calibrated"
+                        },
+                    )
+                }
+                Text(
+                    "Scores the intraday Stress timeline by standardising heart rate to your own baseline " +
+                        "and mapping it onto the 0–3 scale, instead of the default day-relative read. Opt-in " +
+                        "and experimental — it only changes the timeline (the daily score, tiles and trend are " +
+                        "unchanged), and the default stays in place if you leave this off. Open the Stress " +
+                        "screen to see it.",
                     style = NoopType.caption,
                     color = Palette.textTertiary,
                 )

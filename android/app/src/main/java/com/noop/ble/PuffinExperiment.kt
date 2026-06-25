@@ -56,6 +56,15 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         get() = prefs.getBoolean(KEY_EXPERIMENTAL_SLEEP_V2, false)
         set(v) = prefs.edit().putBoolean(KEY_EXPERIMENTAL_SLEEP_V2, v).apply()
 
+    /** True if the user opted in to "Experimental stress engine (calibrated)": the intraday Stress
+     *  timeline is computed by [com.noop.analytics.StressEngine] (HR standardised to the wearer's own
+     *  baseline, mapped onto an absolute 0–3 scale) instead of the default day-self-referential
+     *  [com.noop.analytics.DaytimeStress]. Pure analysis switch — it changes ONLY how the intraday
+     *  timeline is scored; the daily score, tiles and trend are untouched. Model-agnostic. Default false. */
+    var experimentalStressEngine: Boolean
+        get() = prefs.getBoolean(KEY_EXPERIMENTAL_STRESS_ENGINE, false)
+        set(v) = prefs.edit().putBoolean(KEY_EXPERIMENTAL_STRESS_ENGINE, v).apply()
+
     companion object {
         /** Persisted preferences file. */
         private const val PREFS = "noop_experiments"
@@ -74,6 +83,9 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
 
         /** "Experimental sleep staging (V2)" opt-in (mirrors macOS `PuffinExperiment.experimentalSleepV2Key`). */
         const val KEY_EXPERIMENTAL_SLEEP_V2 = "noopExperimentalSleepV2"
+
+        /** "Experimental stress engine (calibrated)" opt-in. */
+        const val KEY_EXPERIMENTAL_STRESS_ENGINE = "noopExperimentalStressEngine"
 
         fun from(context: Context): PuffinExperiment =
             PuffinExperiment(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
